@@ -1,7 +1,3 @@
-// Bevy systems' Query types are inherently nested and trip type_complexity;
-// extracting type aliases for each one is noise without real clarity gain.
-#![allow(clippy::type_complexity)]
-
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
@@ -598,7 +594,8 @@ fn find_path(
     }
     // None at the start cell means "no parent"; Some((prev, dir)) elsewhere
     // means "I was reached from prev by stepping `dir`."
-    let mut came_from: HashMap<(i32, i32), Option<((i32, i32), Direction)>> = HashMap::new();
+    type Parents = HashMap<(i32, i32), Option<((i32, i32), Direction)>>;
+    let mut came_from: Parents = HashMap::new();
     let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
     queue.push_back((start.x, start.y));
     came_from.insert((start.x, start.y), None);
@@ -702,6 +699,9 @@ fn advance_tick(mut tick: ResMut<Tick>) {
     tick.0 = tick.0.wrapping_add(1);
 }
 
+// Bevy's Query<Data, Filter> signatures are inherently nested; a type alias
+// per system body would be more noise than the inline form.
+#[allow(clippy::type_complexity)]
 fn step_workers(
     world: Res<World>,
     mut commands: Commands,
