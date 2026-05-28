@@ -1,11 +1,18 @@
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const GRID_W: i32 = 20;
 const GRID_H: i32 = 15;
 const START: GridPos = GridPos { x: 5, y: 5 };
+const NUM_WORKERS: usize = 4;
+const CARDINAL_DIRS: [Direction; 4] = [
+    Direction::North,
+    Direction::South,
+    Direction::East,
+    Direction::West,
+];
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Direction {
@@ -17,9 +24,12 @@ enum Direction {
 
 impl Direction {
     fn delta(self) -> (i32, i32) {
+        // Camera looks toward -Z from a +Z vantage point, so -Z appears at
+        // the top of the screen. North is "up on screen / away from player",
+        // which is -Z in world == -Y on the grid.
         match self {
-            Direction::North => (0, 1),
-            Direction::South => (0, -1),
+            Direction::North => (0, -1),
+            Direction::South => (0, 1),
             Direction::East => (1, 0),
             Direction::West => (-1, 0),
         }
@@ -29,8 +39,8 @@ impl Direction {
     fn yaw(self) -> f32 {
         use std::f32::consts::{FRAC_PI_2, PI};
         match self {
-            Direction::South => 0.0,
-            Direction::North => PI,
+            Direction::North => 0.0,
+            Direction::South => PI,
             Direction::East => -FRAC_PI_2,
             Direction::West => FRAC_PI_2,
         }
@@ -57,7 +67,16 @@ enum Action {
     NavigateTo(NavQualifier, Target),
 }
 
-#[derive(Component, Copy, Clone, Debug, PartialEq, Eq)]
+// Per-tick tile lock key. Each (GridPos, TileAction) pair can be acquired at
+// most once per tick — the first worker to try wins. Generalises "two
+// workers can't both pickup from the same tile this tick" to anything else
+// that needs the same uniqueness later (combat, building, etc.).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum TileAction {
+    Pickup,
+}
+
+#[derive(Component, Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct GridPos {
     x: i32,
     y: i32,
@@ -265,9 +284,19 @@ struct Base {
 // Cached navigation plan. While `plan` is non-empty, NavigateTo holds the pc
 // and consumes one step per tick. Plan is recomputed lazily whenever it's
 // empty at the start of a NavigateTo execution.
+//
+// `energy_target` is the tile this worker has reserved while pathing toward
+// it. step_workers consults every worker's claim before picking a fresh
+// target so two workers don't converge on the same node. A claim is set
+// only when navigate_to(energy) computes a non-empty path — if the worker
+// is already standing on an energy tile no claim is needed (the next
+// Pickup fires immediately). The claim is released when the worker picks
+// up at the reserved tile, re-plans navigate_to, or the program is
+// recompiled.
 #[derive(Component, Default)]
 struct NavState {
     plan: VecDeque<Direction>,
+    energy_target: Option<GridPos>,
 }
 
 // Visual interpolation. prev is the world position at the previous fixed tick;
@@ -443,6 +472,7 @@ fn setup(
         metallic: 0.2,
         ..default()
     });
+    let mut energy_positions: HashSet<GridPos> = HashSet::new();
     for gy in 0..GRID_H {
         for gx in 0..GRID_W {
             if (gx, gy) == (START.x, START.y) {
@@ -456,9 +486,11 @@ fn setup(
             // seed decorrelates resource placement from terrain choice.
             if tile_hash(gx ^ 0x9e37, gy ^ 0x79b9) % 100 < 8 {
                 let (x, z) = grid_to_world(gx, gy);
+                let pos = GridPos { x: gx, y: gy };
+                energy_positions.insert(pos);
                 commands.spawn((
                     EnergyNode,
-                    GridPos { x: gx, y: gy },
+                    pos,
                     Mesh3d(energy_mesh.clone()),
                     MeshMaterial3d(energy_mat.clone()),
                     Transform::from_xyz(x, 0.35, z)
@@ -468,6 +500,10 @@ fn setup(
         }
     }
 
+    // Compute spawn cells before moving `world` into the ECS resource. Skip
+    // tiles that already hold an energy node so workers don't materialise on
+    // top of one (which would trigger an instant pickup on tick 1).
+    let worker_starts = worker_start_positions(&world, START, NUM_WORKERS, &energy_positions);
     commands.insert_resource(world);
 
     // Base — sits at the worker's start cell so home == origin.
@@ -486,8 +522,9 @@ fn setup(
         Transform::from_xyz(wx, 0.07, wz),
     ));
 
-    // Worker.
-    let start_world = Vec3::new(wx, 0.45, wz);
+    // Workers — share one mesh + material so adding more is cheap. The base
+    // sits on START, so worker_start_positions hands back START itself first
+    // and the remaining workers cluster outward over passable terrain.
     let initial = parse_program(DEFAULT_PROGRAM).unwrap_or_default();
     let initial_yaw = initial
         .iter()
@@ -496,39 +533,67 @@ fn setup(
             _ => None,
         })
         .unwrap_or(0.0);
-    let nose_mesh = meshes.add(Cuboid::new(0.22, 0.22, 0.22));
-    let nose_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.15, 0.10, 0.05),
-        perceptual_roughness: 0.6,
-        ..default()
-    });
+    let assets = WorkerAssets {
+        body_mesh: meshes.add(Cuboid::new(0.7, 0.7, 0.7)),
+        body_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.95, 0.75, 0.25),
+            perceptual_roughness: 0.4,
+            metallic: 0.1,
+            ..default()
+        }),
+        nose_mesh: meshes.add(Cuboid::new(0.22, 0.22, 0.22)),
+        nose_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.15, 0.10, 0.05),
+            perceptual_roughness: 0.6,
+            ..default()
+        }),
+    };
+    for grid_pos in worker_starts {
+        spawn_worker(&mut commands, grid_pos, initial.clone(), initial_yaw, &assets);
+    }
+}
+
+// Mesh/material handles shared across every worker spawn. Bundling them keeps
+// spawn_worker's signature short and makes "one extra clone per worker" the
+// obvious cost model.
+struct WorkerAssets {
+    body_mesh: Handle<Mesh>,
+    body_mat: Handle<StandardMaterial>,
+    nose_mesh: Handle<Mesh>,
+    nose_mat: Handle<StandardMaterial>,
+}
+
+fn spawn_worker(
+    commands: &mut Commands,
+    grid_pos: GridPos,
+    program: Vec<Action>,
+    initial_yaw: f32,
+    assets: &WorkerAssets,
+) {
+    let (x, z) = grid_to_world(grid_pos.x, grid_pos.y);
+    let world_pos = Vec3::new(x, 0.45, z);
     commands
         .spawn((
             Worker,
-            START,
+            grid_pos,
             Inventory::default(),
             NavState::default(),
             Program {
-                instructions: initial,
+                instructions: program,
                 pc: 0,
             },
             MoveAnim {
-                prev: start_world,
-                current: start_world,
+                prev: world_pos,
+                current: world_pos,
             },
             Facing {
                 prev_yaw: initial_yaw,
                 current_yaw: initial_yaw,
             },
-            Mesh3d(meshes.add(Cuboid::new(0.7, 0.7, 0.7))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.95, 0.75, 0.25),
-                perceptual_roughness: 0.4,
-                metallic: 0.1,
-                ..default()
-            })),
+            Mesh3d(assets.body_mesh.clone()),
+            MeshMaterial3d(assets.body_mat.clone()),
             Transform {
-                translation: start_world,
+                translation: world_pos,
                 rotation: Quat::from_rotation_y(initial_yaw),
                 ..default()
             },
@@ -536,8 +601,8 @@ fn setup(
         .with_children(|p| {
             // Nose marker — sits just in front of the worker (local -Z face).
             p.spawn((
-                Mesh3d(nose_mesh),
-                MeshMaterial3d(nose_mat),
+                Mesh3d(assets.nose_mesh.clone()),
+                MeshMaterial3d(assets.nose_mat.clone()),
                 Transform::from_xyz(0.0, 0.05, -0.45),
             ));
         });
@@ -600,15 +665,8 @@ fn find_path(
     queue.push_back((start.x, start.y));
     came_from.insert((start.x, start.y), None);
 
-    const DIRS: [Direction; 4] = [
-        Direction::North,
-        Direction::South,
-        Direction::East,
-        Direction::West,
-    ];
-
     while let Some((cx, cy)) = queue.pop_front() {
-        for dir in DIRS {
+        for dir in CARDINAL_DIRS {
             let (dx, dy) = dir.delta();
             let nx = cx + dx;
             let ny = cy + dy;
@@ -635,6 +693,54 @@ fn find_path(
         }
     }
     None
+}
+
+// BFS outward from `start` over passable terrain, collecting up to `n` cells
+// that aren't in `excluded`. Used at spawn time to lay out N workers in a
+// connected cluster near the base without stacking them on the same tile or
+// landing them on top of existing entities (e.g. energy nodes). BFS still
+// expands *through* excluded cells, so the cluster can extend past them. If
+// `start` is in `excluded` or not passable, or fewer than `n` eligible
+// cells are reachable, the returned vector is correspondingly shorter.
+fn worker_start_positions(
+    world: &World,
+    start: GridPos,
+    n: usize,
+    excluded: &HashSet<GridPos>,
+) -> Vec<GridPos> {
+    let mut out = Vec::with_capacity(n);
+    if n == 0 || !matches!(world.get(start.x, start.y), Some(t) if t.passable()) {
+        return out;
+    }
+    let mut visited: HashSet<(i32, i32)> = HashSet::new();
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    queue.push_back((start.x, start.y));
+    visited.insert((start.x, start.y));
+
+    while let Some((cx, cy)) = queue.pop_front() {
+        let cell = GridPos { x: cx, y: cy };
+        if !excluded.contains(&cell) {
+            out.push(cell);
+            if out.len() == n {
+                return out;
+            }
+        }
+        for dir in CARDINAL_DIRS {
+            let (dx, dy) = dir.delta();
+            let nx = cx + dx;
+            let ny = cy + dy;
+            if visited.contains(&(nx, ny)) {
+                continue;
+            }
+            let Some(t) = world.get(nx, ny) else { continue };
+            if !t.passable() {
+                continue;
+            }
+            visited.insert((nx, ny));
+            queue.push_back((nx, ny));
+        }
+    }
+    out
 }
 
 // Grid cell (gx, gy) maps to world (x, z). Y is up in 3D and reserved for height.
@@ -718,6 +824,22 @@ fn step_workers(
         (With<Worker>, Without<EnergyNode>, Without<Base>),
     >,
 ) {
+    // Tile actions taken so far this tick. The first worker to attempt a
+    // (tile, action) wins and inserts the key; later workers see the lock
+    // and skip. Today this stops two workers from both despawning the same
+    // energy entity (and double-incrementing inventory) when they share a
+    // tile — Bevy's commands are queued, so energy_q is otherwise stale.
+    let mut tile_locks: HashSet<(GridPos, TileAction)> = HashSet::new();
+
+    // Snapshot of every worker's outstanding energy reservation. Each worker
+    // planning a fresh navigate_to(energy) excludes tiles already in this
+    // set, then inserts its own choice — so later workers in the same tick
+    // see earlier workers' claims.
+    let mut energy_claims: HashSet<GridPos> = workers
+        .iter()
+        .filter_map(|(_, _, _, _, nav)| nav.energy_target)
+        .collect();
+
     for (mut pos, mut prog, mut facing, mut inv, mut nav) in &mut workers {
         if prog.instructions.is_empty() {
             continue;
@@ -731,12 +853,27 @@ fn step_workers(
                 step_in_direction(&world, &mut pos, &mut facing, dir);
             }
             Action::Pickup => {
-                for (ent, epos) in &energy_q {
-                    if *epos == *pos {
-                        commands.entity(ent).despawn();
-                        inv.energy += 1;
-                        break;
+                // insert() returns true on first acquire, false if another
+                // worker already claimed this tile-action this tick.
+                if tile_locks.insert((*pos, TileAction::Pickup)) {
+                    for (ent, epos) in &energy_q {
+                        if *epos == *pos {
+                            commands.entity(ent).despawn();
+                            inv.energy += 1;
+                            break;
+                        }
                     }
+                }
+                // Clear the reservation only if it was for this tile —
+                // we're done with it. We deliberately do NOT remove it
+                // from `energy_claims` this tick: despawns are queued,
+                // so `energy_q` still lists the just-consumed node, and
+                // dropping the claim now would let other workers later
+                // in this same tick re-target the stale tile. The claim
+                // falls out naturally next tick when `energy_claims` is
+                // rebuilt from (now-cleared) NavStates.
+                if nav.energy_target == Some(*pos) {
+                    nav.energy_target = None;
                 }
             }
             Action::Drop => {
@@ -754,15 +891,35 @@ fn step_workers(
             Action::NavigateTo(_qualifier, target) => {
                 // Lazy plan: only recompute when we have no cached steps.
                 if nav.plan.is_empty() {
+                    // Drop our own claim before re-planning so we can validly
+                    // re-target it (or move on to a different one).
+                    if let Some(prev) = nav.energy_target.take() {
+                        energy_claims.remove(&prev);
+                    }
                     let targets: Vec<GridPos> = match target {
-                        Target::Energy => energy_q.iter().map(|(_, p)| *p).collect(),
+                        Target::Energy => energy_q
+                            .iter()
+                            .map(|(_, p)| *p)
+                            .filter(|p| !energy_claims.contains(p))
+                            .collect(),
                         Target::Base => base_q.iter().map(|(p, _)| *p).collect(),
                     };
                     // find_path with an empty target set returns None, which
                     // unwrap_or_default collapses to an empty plan — same as
                     // "no path found", so no separate empty-guard is needed.
-                    nav.plan = find_path(&world, *pos, |p| targets.contains(&p))
+                    let plan = find_path(&world, *pos, |p| targets.contains(&p))
                         .unwrap_or_default();
+                    if let (Target::Energy, false) = (target, plan.is_empty()) {
+                        // Lock in the destination tile so other workers
+                        // don't race for it. We only claim when the plan is
+                        // non-empty — standing on an energy tile means the
+                        // next instruction (typically Pickup) will fire and
+                        // no lock is needed.
+                        let dest = path_destination(*pos, &plan);
+                        nav.energy_target = Some(dest);
+                        energy_claims.insert(dest);
+                    }
+                    nav.plan = plan;
                 }
                 if let Some(dir) = nav.plan.pop_front() {
                     step_in_direction(&world, &mut pos, &mut facing, dir);
@@ -775,6 +932,19 @@ fn step_workers(
             prog.pc = (prog.pc + 1) % prog.instructions.len();
         }
     }
+}
+
+// Walks a plan from `start` and returns the cell it terminates at. Used to
+// derive the destination of a BFS path so it can be reserved without changing
+// find_path's signature.
+fn path_destination(start: GridPos, plan: &VecDeque<Direction>) -> GridPos {
+    let mut p = start;
+    for d in plan {
+        let (dx, dy) = d.delta();
+        p.x += dx;
+        p.y += dy;
+    }
+    p
 }
 
 fn orbit_camera_input(
@@ -896,7 +1066,7 @@ fn interpolate_transforms(
 fn editor_ui(
     mut contexts: EguiContexts,
     mut editor: ResMut<Editor>,
-    mut q: Query<(&mut Program, &Inventory), With<Worker>>,
+    mut q: Query<(&mut Program, &Inventory, &mut NavState), With<Worker>>,
     bases: Query<&Base>,
     tick: Res<Tick>,
 ) {
@@ -922,9 +1092,13 @@ fn editor_ui(
                 match parse_program(&editor.source) {
                     Ok(instrs) => {
                         let n = instrs.len();
-                        for (mut prog, _) in &mut q {
+                        for (mut prog, _, mut nav) in &mut q {
                             prog.instructions = instrs.clone();
                             prog.pc = 0;
+                            // Drop any cached plan + reservation so the new
+                            // program doesn't continue walking toward a tile
+                            // the old script was targeting.
+                            *nav = NavState::default();
                         }
                         editor.status = format!("Loaded {n} instruction(s).");
                     }
@@ -938,14 +1112,19 @@ fn editor_ui(
             ui.label(&editor.status);
             ui.separator();
             ui.label(format!("tick: {}", tick.0));
-            if let Ok((prog, inv)) = q.single() {
+            // All workers run the same script, so pc/program length are the
+            // same across them; sample the first. Energy is per-worker so we
+            // sum it.
+            ui.label(format!("workers: {}", q.iter().count()));
+            if let Some((prog, _, _)) = q.iter().next() {
                 ui.label(format!(
                     "pc: {} / {}",
                     prog.pc,
                     prog.instructions.len()
                 ));
-                ui.label(format!("energy: {}", inv.energy));
             }
+            let carried: u32 = q.iter().map(|(_, inv, _)| inv.energy).sum();
+            ui.label(format!("carried: {carried}"));
             if let Ok(base) = bases.single() {
                 ui.label(format!("delivered: {}", base.stored));
             }
@@ -1043,7 +1222,92 @@ mod tests {
         let far = GridPos { x: 5, y: 12 };
         let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == near || p == far).unwrap();
         // BFS expands by distance, so the 1-step target wins over the 7-step one.
-        assert_eq!(p, VecDeque::from(vec![Direction::North]));
+        // (+1 in grid Y is South after the N/S swap.)
+        assert_eq!(p, VecDeque::from(vec![Direction::South]));
+    }
+
+    // --- worker_start_positions ---------------------------------------------
+
+    #[test]
+    fn worker_start_positions_returns_start_first() {
+        let w = flat_grass_world();
+        let starts =
+            worker_start_positions(&w, GridPos { x: 5, y: 5 }, 1, &HashSet::new());
+        assert_eq!(starts, vec![GridPos { x: 5, y: 5 }]);
+    }
+
+    #[test]
+    fn worker_start_positions_returns_n_distinct_cells() {
+        let w = flat_grass_world();
+        let starts =
+            worker_start_positions(&w, GridPos { x: 5, y: 5 }, 4, &HashSet::new());
+        assert_eq!(starts.len(), 4);
+        // All distinct.
+        for i in 0..starts.len() {
+            for j in (i + 1)..starts.len() {
+                assert_ne!(starts[i], starts[j], "duplicate start at {i} and {j}");
+            }
+        }
+        // First slot is always the requested start cell.
+        assert_eq!(starts[0], GridPos { x: 5, y: 5 });
+    }
+
+    #[test]
+    fn worker_start_positions_skips_impassable_neighbors() {
+        let mut w = flat_grass_world();
+        // East neighbor wall, west neighbor water. North/south stay passable,
+        // so 3 cells (start + N + S) must come back — and neither blocked
+        // neighbor cell should appear.
+        place(&mut w, 6, 5, Terrain::Wall);
+        place(&mut w, 4, 5, Terrain::Water);
+        let starts =
+            worker_start_positions(&w, GridPos { x: 5, y: 5 }, 3, &HashSet::new());
+        assert_eq!(starts.len(), 3);
+        for p in &starts {
+            let t = w.get(p.x, p.y).unwrap();
+            assert!(t.passable(), "start {p:?} landed on impassable {t:?}");
+            assert_ne!(*p, GridPos { x: 6, y: 5 });
+            assert_ne!(*p, GridPos { x: 4, y: 5 });
+        }
+    }
+
+    #[test]
+    fn worker_start_positions_caps_when_not_enough_passable_cells() {
+        let mut w = flat_grass_world();
+        // Box the start cell in — only START itself is passable.
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            place(&mut w, 5 + dx, 5 + dy, Terrain::Wall);
+        }
+        let starts =
+            worker_start_positions(&w, GridPos { x: 5, y: 5 }, 8, &HashSet::new());
+        assert_eq!(starts, vec![GridPos { x: 5, y: 5 }]);
+    }
+
+    #[test]
+    fn worker_start_positions_skips_excluded_tiles_but_expands_through_them() {
+        let mut w = flat_grass_world();
+        // Wall off S/E/W of start so the only escape is north. The north
+        // neighbor (5,4) is grass but excluded (simulating an energy node
+        // sitting on it). Without expanding through excluded cells we'd
+        // get only (5,5); with it, (5,3) and beyond stay reachable.
+        place(&mut w, 5, 6, Terrain::Wall);
+        place(&mut w, 6, 5, Terrain::Wall);
+        place(&mut w, 4, 5, Terrain::Wall);
+        let mut excluded = HashSet::new();
+        excluded.insert(GridPos { x: 5, y: 4 });
+        let starts = worker_start_positions(&w, GridPos { x: 5, y: 5 }, 3, &excluded);
+        assert_eq!(starts.len(), 3, "starts={starts:?}");
+        assert_eq!(starts[0], GridPos { x: 5, y: 5 });
+        assert!(
+            !starts.contains(&GridPos { x: 5, y: 4 }),
+            "excluded tile should not appear in starts"
+        );
+        // The cell two north of start is only reachable by expanding through
+        // the excluded tile.
+        assert!(
+            starts.contains(&GridPos { x: 5, y: 3 }),
+            "expected (5,3) reachable via excluded (5,4); starts={starts:?}"
+        );
     }
 
     // --- try_walk ------------------------------------------------------------
@@ -1147,6 +1411,231 @@ mod tests {
             anim.current,
             Vec3::new(x1, 0.45, z1),
             "current must reflect the new GridPos"
+        );
+    }
+
+    // --- step_workers energy reservation ------------------------------------
+
+    fn spawn_navigator(world: &mut bevy::ecs::world::World, pos: GridPos) -> Entity {
+        world
+            .spawn((
+                Worker,
+                pos,
+                Inventory::default(),
+                NavState::default(),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::NavigateTo(
+                        NavQualifier::Closest,
+                        Target::Energy,
+                    )],
+                    pc: 0,
+                },
+            ))
+            .id()
+    }
+
+    #[test]
+    fn navigate_to_energy_reserves_target_so_workers_pick_different_tiles() {
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        });
+
+        // Two energy tiles five and six steps north of the workers — far
+        // enough that one-tick paths don't drain to empty, so energy_target
+        // is still set when we inspect it.
+        world.spawn((EnergyNode, GridPos { x: 5, y: 10 }));
+        world.spawn((EnergyNode, GridPos { x: 5, y: 11 }));
+
+        let w1 = spawn_navigator(&mut world, GridPos { x: 5, y: 5 });
+        let w2 = spawn_navigator(&mut world, GridPos { x: 5, y: 5 });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        let t1 = world.get::<NavState>(w1).unwrap().energy_target;
+        let t2 = world.get::<NavState>(w2).unwrap().energy_target;
+        assert!(t1.is_some() && t2.is_some(), "both workers should hold a claim");
+        assert_ne!(t1, t2, "workers must reserve different energy tiles");
+        let mut targets = [t1.unwrap(), t2.unwrap()];
+        targets.sort_by_key(|p| (p.y, p.x));
+        assert_eq!(
+            targets,
+            [GridPos { x: 5, y: 10 }, GridPos { x: 5, y: 11 }]
+        );
+    }
+
+    #[test]
+    fn pickup_does_not_unclaim_tile_within_same_tick() {
+        // Two workers, two energy tiles. Worker A is already on its
+        // reserved tile and Pickups this tick. Worker B is far away and
+        // plans navigate_to(energy) this tick. Because A's despawn is
+        // deferred, energy_q still lists A's tile during B's planning —
+        // so the reservation set must keep A's tile claimed until next
+        // tick, otherwise B would re-target the stale tile.
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        });
+        let a_tile = GridPos { x: 5, y: 5 };
+        let other = GridPos { x: 10, y: 10 };
+        world.spawn((EnergyNode, a_tile));
+        world.spawn((EnergyNode, other));
+
+        // Worker A — about to pick up at its reserved tile.
+        world.spawn((
+            Worker,
+            a_tile,
+            Inventory::default(),
+            NavState {
+                plan: VecDeque::new(),
+                energy_target: Some(a_tile),
+            },
+            Facing {
+                prev_yaw: 0.0,
+                current_yaw: 0.0,
+            },
+            Program {
+                instructions: vec![Action::Pickup],
+                pc: 0,
+            },
+        ));
+        // Worker B — about to plan a fresh navigate_to(energy).
+        let b = world
+            .spawn((
+                Worker,
+                GridPos { x: 0, y: 0 },
+                Inventory::default(),
+                NavState::default(),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::NavigateTo(
+                        NavQualifier::Closest,
+                        Target::Energy,
+                    )],
+                    pc: 0,
+                },
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        let target_b = world.get::<NavState>(b).unwrap().energy_target;
+        assert_ne!(
+            target_b,
+            Some(a_tile),
+            "B targeted the tile A just picked up — claim was released too eagerly"
+        );
+        assert_eq!(
+            target_b,
+            Some(other),
+            "B should have targeted the only other available tile"
+        );
+    }
+
+    #[test]
+    fn pickup_releases_energy_reservation() {
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        });
+        world.spawn((EnergyNode, GridPos { x: 5, y: 5 }));
+
+        // Worker is standing on an energy tile with a stale reservation,
+        // running Pickup. After the tick, the reservation must be cleared
+        // so other workers' next plan sees the tile as free.
+        let w = world
+            .spawn((
+                Worker,
+                GridPos { x: 5, y: 5 },
+                Inventory::default(),
+                NavState {
+                    plan: VecDeque::new(),
+                    energy_target: Some(GridPos { x: 5, y: 5 }),
+                },
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::Pickup],
+                    pc: 0,
+                },
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert_eq!(
+            world.get::<NavState>(w).unwrap().energy_target,
+            None,
+            "Pickup must release the energy reservation"
+        );
+        assert_eq!(world.get::<Inventory>(w).unwrap().energy, 1);
+    }
+
+    // --- step_workers pickup contention -------------------------------------
+
+    #[test]
+    fn pickup_only_one_worker_consumes_same_tile_energy() {
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        });
+
+        let energy_ent = world
+            .spawn((EnergyNode, GridPos { x: 5, y: 5 }))
+            .id();
+
+        let pickup_prog = || Program {
+            instructions: vec![Action::Pickup],
+            pc: 0,
+        };
+        let make_worker = |w: &mut bevy::ecs::world::World| {
+            w.spawn((
+                Worker,
+                GridPos { x: 5, y: 5 },
+                Inventory::default(),
+                NavState::default(),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                pickup_prog(),
+            ))
+            .id()
+        };
+        let w1 = make_worker(&mut world);
+        let w2 = make_worker(&mut world);
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        // Energy entity must be despawned exactly once.
+        assert!(
+            world.get_entity(energy_ent).is_err(),
+            "energy entity should be despawned"
+        );
+        // Exactly one worker should have picked it up — phantom energy is a bug.
+        let e1 = world.get::<Inventory>(w1).unwrap().energy;
+        let e2 = world.get::<Inventory>(w2).unwrap().energy;
+        assert_eq!(
+            e1 + e2,
+            1,
+            "expected exactly one worker to grab the energy, got e1={e1} e2={e2}"
         );
     }
 
