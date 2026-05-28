@@ -193,8 +193,12 @@ struct Base {
 //
 // `energy_target` is the tile this worker has reserved while pathing toward
 // it. step_workers consults every worker's claim before picking a fresh
-// target so two workers don't converge on the same node. The claim is held
-// from the moment a plan is computed until Pickup runs (success or no-op).
+// target so two workers don't converge on the same node. A claim is set
+// only when navigate_to(energy) computes a non-empty path — if the worker
+// is already standing on an energy tile no claim is needed (the next
+// Pickup fires immediately). The claim is released when the worker picks
+// up at the reserved tile, re-plans navigate_to, or the program is
+// recompiled.
 #[derive(Component, Default)]
 struct NavState {
     plan: VecDeque<Direction>,
@@ -374,6 +378,7 @@ fn setup(
         metallic: 0.2,
         ..default()
     });
+    let mut energy_positions: HashSet<GridPos> = HashSet::new();
     for gy in 0..GRID_H {
         for gx in 0..GRID_W {
             if (gx, gy) == (START.x, START.y) {
@@ -387,9 +392,11 @@ fn setup(
             // seed decorrelates resource placement from terrain choice.
             if tile_hash(gx ^ 0x9e37, gy ^ 0x79b9) % 100 < 8 {
                 let (x, z) = grid_to_world(gx, gy);
+                let pos = GridPos { x: gx, y: gy };
+                energy_positions.insert(pos);
                 commands.spawn((
                     EnergyNode,
-                    GridPos { x: gx, y: gy },
+                    pos,
                     Mesh3d(energy_mesh.clone()),
                     MeshMaterial3d(energy_mat.clone()),
                     Transform::from_xyz(x, 0.35, z)
@@ -399,8 +406,10 @@ fn setup(
         }
     }
 
-    // Compute spawn cells before moving `world` into the ECS resource.
-    let worker_starts = worker_start_positions(&world, START, NUM_WORKERS);
+    // Compute spawn cells before moving `world` into the ECS resource. Skip
+    // tiles that already hold an energy node so workers don't materialise on
+    // top of one (which would trigger an instant pickup on tick 1).
+    let worker_starts = worker_start_positions(&world, START, NUM_WORKERS, &energy_positions);
     commands.insert_resource(world);
 
     // Base — sits at the worker's start cell so home == origin.
@@ -591,12 +600,19 @@ fn find_path(
     None
 }
 
-// BFS outward from `start` over passable terrain, collecting up to `n` cells.
-// Used at spawn time to lay out N workers in a connected cluster near the
-// base without stacking them on the same tile. If `start` itself isn't
-// passable or fewer than `n` passable cells are reachable, the returned
-// vector is correspondingly shorter.
-fn worker_start_positions(world: &World, start: GridPos, n: usize) -> Vec<GridPos> {
+// BFS outward from `start` over passable terrain, collecting up to `n` cells
+// that aren't in `excluded`. Used at spawn time to lay out N workers in a
+// connected cluster near the base without stacking them on the same tile or
+// landing them on top of existing entities (e.g. energy nodes). BFS still
+// expands *through* excluded cells, so the cluster can extend past them. If
+// `start` is in `excluded` or not passable, or fewer than `n` eligible
+// cells are reachable, the returned vector is correspondingly shorter.
+fn worker_start_positions(
+    world: &World,
+    start: GridPos,
+    n: usize,
+    excluded: &HashSet<GridPos>,
+) -> Vec<GridPos> {
     let mut out = Vec::with_capacity(n);
     if n == 0 || !matches!(world.get(start.x, start.y), Some(t) if t.passable()) {
         return out;
@@ -607,9 +623,12 @@ fn worker_start_positions(world: &World, start: GridPos, n: usize) -> Vec<GridPo
     visited.insert((start.x, start.y));
 
     while let Some((cx, cy)) = queue.pop_front() {
-        out.push(GridPos { x: cx, y: cy });
-        if out.len() == n {
-            return out;
+        let cell = GridPos { x: cx, y: cy };
+        if !excluded.contains(&cell) {
+            out.push(cell);
+            if out.len() == n {
+                return out;
+            }
         }
         for dir in CARDINAL_DIRS {
             let (dx, dy) = dir.delta();
@@ -749,11 +768,16 @@ fn step_workers(
                         }
                     }
                 }
-                // Release any reservation — the tile is either ours now or
-                // already gone, either way we're done holding it for path
-                // planning purposes.
-                if let Some(prev) = nav.energy_target.take() {
-                    energy_claims.remove(&prev);
+                // Clear the reservation only if it was for this tile —
+                // we're done with it. We deliberately do NOT remove it
+                // from `energy_claims` this tick: despawns are queued,
+                // so `energy_q` still lists the just-consumed node, and
+                // dropping the claim now would let other workers later
+                // in this same tick re-target the stale tile. The claim
+                // falls out naturally next tick when `energy_claims` is
+                // rebuilt from (now-cleared) NavStates.
+                if nav.energy_target == Some(*pos) {
+                    nav.energy_target = None;
                 }
             }
             Action::Drop => {
@@ -1090,14 +1114,16 @@ mod tests {
     #[test]
     fn worker_start_positions_returns_start_first() {
         let w = flat_grass_world();
-        let starts = worker_start_positions(&w, GridPos { x: 5, y: 5 }, 1);
+        let starts =
+            worker_start_positions(&w, GridPos { x: 5, y: 5 }, 1, &HashSet::new());
         assert_eq!(starts, vec![GridPos { x: 5, y: 5 }]);
     }
 
     #[test]
     fn worker_start_positions_returns_n_distinct_cells() {
         let w = flat_grass_world();
-        let starts = worker_start_positions(&w, GridPos { x: 5, y: 5 }, 4);
+        let starts =
+            worker_start_positions(&w, GridPos { x: 5, y: 5 }, 4, &HashSet::new());
         assert_eq!(starts.len(), 4);
         // All distinct.
         for i in 0..starts.len() {
@@ -1117,7 +1143,8 @@ mod tests {
         // neighbor cell should appear.
         place(&mut w, 6, 5, Terrain::Wall);
         place(&mut w, 4, 5, Terrain::Water);
-        let starts = worker_start_positions(&w, GridPos { x: 5, y: 5 }, 3);
+        let starts =
+            worker_start_positions(&w, GridPos { x: 5, y: 5 }, 3, &HashSet::new());
         assert_eq!(starts.len(), 3);
         for p in &starts {
             let t = w.get(p.x, p.y).unwrap();
@@ -1134,8 +1161,36 @@ mod tests {
         for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
             place(&mut w, 5 + dx, 5 + dy, Terrain::Wall);
         }
-        let starts = worker_start_positions(&w, GridPos { x: 5, y: 5 }, 8);
+        let starts =
+            worker_start_positions(&w, GridPos { x: 5, y: 5 }, 8, &HashSet::new());
         assert_eq!(starts, vec![GridPos { x: 5, y: 5 }]);
+    }
+
+    #[test]
+    fn worker_start_positions_skips_excluded_tiles_but_expands_through_them() {
+        let mut w = flat_grass_world();
+        // Wall off S/E/W of start so the only escape is north. The north
+        // neighbor (5,4) is grass but excluded (simulating an energy node
+        // sitting on it). Without expanding through excluded cells we'd
+        // get only (5,5); with it, (5,3) and beyond stay reachable.
+        place(&mut w, 5, 6, Terrain::Wall);
+        place(&mut w, 6, 5, Terrain::Wall);
+        place(&mut w, 4, 5, Terrain::Wall);
+        let mut excluded = HashSet::new();
+        excluded.insert(GridPos { x: 5, y: 4 });
+        let starts = worker_start_positions(&w, GridPos { x: 5, y: 5 }, 3, &excluded);
+        assert_eq!(starts.len(), 3, "starts={starts:?}");
+        assert_eq!(starts[0], GridPos { x: 5, y: 5 });
+        assert!(
+            !starts.contains(&GridPos { x: 5, y: 4 }),
+            "excluded tile should not appear in starts"
+        );
+        // The cell two north of start is only reachable by expanding through
+        // the excluded tile.
+        assert!(
+            starts.contains(&GridPos { x: 5, y: 3 }),
+            "expected (5,3) reachable via excluded (5,4); starts={starts:?}"
+        );
     }
 
     // --- try_walk ------------------------------------------------------------
@@ -1295,6 +1350,79 @@ mod tests {
         assert_eq!(
             targets,
             [GridPos { x: 5, y: 10 }, GridPos { x: 5, y: 11 }]
+        );
+    }
+
+    #[test]
+    fn pickup_does_not_unclaim_tile_within_same_tick() {
+        // Two workers, two energy tiles. Worker A is already on its
+        // reserved tile and Pickups this tick. Worker B is far away and
+        // plans navigate_to(energy) this tick. Because A's despawn is
+        // deferred, energy_q still lists A's tile during B's planning —
+        // so the reservation set must keep A's tile claimed until next
+        // tick, otherwise B would re-target the stale tile.
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        });
+        let a_tile = GridPos { x: 5, y: 5 };
+        let other = GridPos { x: 10, y: 10 };
+        world.spawn((EnergyNode, a_tile));
+        world.spawn((EnergyNode, other));
+
+        // Worker A — about to pick up at its reserved tile.
+        world.spawn((
+            Worker,
+            a_tile,
+            Inventory::default(),
+            NavState {
+                plan: VecDeque::new(),
+                energy_target: Some(a_tile),
+            },
+            Facing {
+                prev_yaw: 0.0,
+                current_yaw: 0.0,
+            },
+            Program {
+                instructions: vec![Action::Pickup],
+                pc: 0,
+            },
+        ));
+        // Worker B — about to plan a fresh navigate_to(energy).
+        let b = world
+            .spawn((
+                Worker,
+                GridPos { x: 0, y: 0 },
+                Inventory::default(),
+                NavState::default(),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::NavigateTo(
+                        NavQualifier::Closest,
+                        Target::Energy,
+                    )],
+                    pc: 0,
+                },
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        let target_b = world.get::<NavState>(b).unwrap().energy_target;
+        assert_ne!(
+            target_b,
+            Some(a_tile),
+            "B targeted the tile A just picked up — claim was released too eagerly"
+        );
+        assert_eq!(
+            target_b,
+            Some(other),
+            "B should have targeted the only other available tile"
         );
     }
 
