@@ -14,7 +14,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # Bevy's default Linux build links against ALSA, udev, wayland, and
-      # xkbcommon; pkg-config wires them up.
+      # xkbcommon; pkg-config wires them up. mold replaces the default
+      # linker (configured per-target in .cargo/config.toml) and cuts the
+      # link step significantly for Bevy's large binary.
       - name: Install Bevy system dependencies
         run: |
           sudo apt-get update
@@ -23,6 +25,7 @@ jobs:
             libudev-dev \
             libwayland-dev \
             libxkbcommon-dev \
+            mold \
             pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
