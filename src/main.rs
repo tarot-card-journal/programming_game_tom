@@ -24,9 +24,12 @@ enum Direction {
 
 impl Direction {
     fn delta(self) -> (i32, i32) {
+        // Camera looks toward -Z from a +Z vantage point, so -Z appears at
+        // the top of the screen. North is "up on screen / away from player",
+        // which is -Z in world == -Y on the grid.
         match self {
-            Direction::North => (0, 1),
-            Direction::South => (0, -1),
+            Direction::North => (0, -1),
+            Direction::South => (0, 1),
             Direction::East => (1, 0),
             Direction::West => (-1, 0),
         }
@@ -36,8 +39,8 @@ impl Direction {
     fn yaw(self) -> f32 {
         use std::f32::consts::{FRAC_PI_2, PI};
         match self {
-            Direction::South => 0.0,
-            Direction::North => PI,
+            Direction::North => 0.0,
+            Direction::South => PI,
             Direction::East => -FRAC_PI_2,
             Direction::West => FRAC_PI_2,
         }
@@ -1078,7 +1081,8 @@ mod tests {
         let far = GridPos { x: 5, y: 12 };
         let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == near || p == far).unwrap();
         // BFS expands by distance, so the 1-step target wins over the 7-step one.
-        assert_eq!(p, VecDeque::from(vec![Direction::North]));
+        // (+1 in grid Y is South after the N/S swap.)
+        assert_eq!(p, VecDeque::from(vec![Direction::South]));
     }
 
     // --- worker_start_positions ---------------------------------------------
