@@ -13,11 +13,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Bevy links against ALSA and udev on Linux; pkg-config wires them up.
+      # Bevy's default Linux build links against ALSA, udev, wayland, and
+      # xkbcommon; pkg-config wires them up.
       - name: Install Bevy system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+          sudo apt-get install -y \
+            libasound2-dev \
+            libudev-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
