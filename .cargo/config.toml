@@ -1,0 +1,5 @@
+# Linux x86_64 only: use mold as the linker. cc (gcc) on the runner picks
+# up mold via -fuse-ld=mold without needing a separate linker binary set.
+# macOS/Windows targets are unaffected — they use their platform default.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
