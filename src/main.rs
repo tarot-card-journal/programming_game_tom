@@ -86,6 +86,23 @@ impl Terrain {
         matches!(self, Terrain::Grass | Terrain::Dirt | Terrain::Stone)
     }
 
+    // Map an elevation value in [0, 1] to a terrain band. Bands are tuned for
+    // value-noise's central-bias distribution, not uniform — the extreme tails
+    // (water, wall) are intentionally narrow.
+    fn from_elevation(n: f32) -> Terrain {
+        if n < 0.30 {
+            Terrain::Water
+        } else if n < 0.42 {
+            Terrain::Dirt
+        } else if n < 0.70 {
+            Terrain::Grass
+        } else if n < 0.84 {
+            Terrain::Stone
+        } else {
+            Terrain::Wall
+        }
+    }
+
     fn color(self) -> Color {
         match self {
             Terrain::Grass => Color::srgb(0.20, 0.36, 0.22),
@@ -108,7 +125,7 @@ impl World {
     }
 
     fn get(&self, x: i32, y: i32) -> Option<Terrain> {
-        if x < 0 || x >= GRID_W || y < 0 || y >= GRID_H {
+        if !(0..GRID_W).contains(&x) || !(0..GRID_H).contains(&y) {
             return None;
         }
         Some(self.tiles[Self::idx(x, y)])
@@ -118,20 +135,68 @@ impl World {
         let mut tiles = vec![Terrain::Grass; (GRID_W * GRID_H) as usize];
         for y in 0..GRID_H {
             for x in 0..GRID_W {
-                let h = tile_hash(x, y);
-                let t = match h % 100 {
-                    0..=4 => Terrain::Stone,
-                    5..=9 => Terrain::Dirt,
-                    10..=12 => Terrain::Water,
-                    13..=15 => Terrain::Wall,
-                    _ => Terrain::Grass,
-                };
-                tiles[Self::idx(x, y)] = t;
+                tiles[Self::idx(x, y)] = Terrain::from_elevation(value_noise(x, y));
             }
         }
         // Guarantee worker's starting cell is walkable.
         tiles[Self::idx(START.x, START.y)] = Terrain::Grass;
-        Self { tiles }
+        let mut world = Self { tiles };
+        world.ensure_connected();
+        world
+    }
+
+    // Carve dirt paths until every passable cell is reachable from START.
+    // Each pass flood-fills from START, picks any stranded passable cell,
+    // and L-carves toward the nearest reachable cell — barrier tiles along
+    // the way become Dirt; passable tiles are left alone.
+    fn ensure_connected(&mut self) {
+        loop {
+            let reachable = self.flood_from(START.x, START.y);
+            let stranded = (0..GRID_H)
+                .flat_map(|y| (0..GRID_W).map(move |x| (x, y)))
+                .find(|&(x, y)| {
+                    self.tiles[Self::idx(x, y)].passable() && !reachable[Self::idx(x, y)]
+                });
+            let Some((sx, sy)) = stranded else { return };
+
+            let (tx, ty) = (0..GRID_H)
+                .flat_map(|y| (0..GRID_W).map(move |x| (x, y)))
+                .filter(|&(x, y)| reachable[Self::idx(x, y)])
+                .min_by_key(|&(x, y)| (x - sx).abs() + (y - sy).abs())
+                .expect("START is always reachable");
+            self.carve(sx, sy, tx, ty);
+        }
+    }
+
+    fn flood_from(&self, sx: i32, sy: i32) -> Vec<bool> {
+        let mut visited = vec![false; (GRID_W * GRID_H) as usize];
+        let mut stack = vec![(sx, sy)];
+        while let Some((x, y)) = stack.pop() {
+            if !(0..GRID_W).contains(&x) || !(0..GRID_H).contains(&y) {
+                continue;
+            }
+            let i = Self::idx(x, y);
+            if visited[i] || !self.tiles[i].passable() {
+                continue;
+            }
+            visited[i] = true;
+            stack.extend_from_slice(&[(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]);
+        }
+        visited
+    }
+
+    fn carve(&mut self, mut x: i32, mut y: i32, tx: i32, ty: i32) {
+        while (x, y) != (tx, ty) {
+            let i = Self::idx(x, y);
+            if !self.tiles[i].passable() {
+                self.tiles[i] = Terrain::Dirt;
+            }
+            if x != tx {
+                x += (tx - x).signum();
+            } else {
+                y += (ty - y).signum();
+            }
+        }
     }
 }
 
@@ -144,6 +209,35 @@ fn tile_hash(x: i32, y: i32) -> u32 {
     h = h.wrapping_mul(0xc2b2ae35);
     h ^= h >> 16;
     h
+}
+
+// Bilinear-interpolated value noise. tile_hash is sampled on a coarse lattice
+// (one sample every NOISE_CELL grid cells), then interpolated with smoothstep
+// easing so neighboring tiles get similar values and terrain forms clusters.
+// Returns a value in [0, 1].
+fn value_noise(x: i32, y: i32) -> f32 {
+    const NOISE_CELL: f32 = 4.5;
+    let fx = x as f32 / NOISE_CELL;
+    let fy = y as f32 / NOISE_CELL;
+    let x0 = fx.floor() as i32;
+    let y0 = fy.floor() as i32;
+    let tx = smoothstep(fx - x0 as f32);
+    let ty = smoothstep(fy - y0 as f32);
+    let v00 = lattice_value(x0, y0);
+    let v10 = lattice_value(x0 + 1, y0);
+    let v01 = lattice_value(x0, y0 + 1);
+    let v11 = lattice_value(x0 + 1, y0 + 1);
+    let a = v00 * (1.0 - tx) + v10 * tx;
+    let b = v01 * (1.0 - tx) + v11 * tx;
+    a * (1.0 - ty) + b * ty
+}
+
+fn lattice_value(ix: i32, iy: i32) -> f32 {
+    tile_hash(ix, iy) as f32 / u32::MAX as f32
+}
+
+fn smoothstep(t: f32) -> f32 {
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[derive(Component, Default)]
@@ -500,7 +594,8 @@ fn find_path(
     }
     // None at the start cell means "no parent"; Some((prev, dir)) elsewhere
     // means "I was reached from prev by stepping `dir`."
-    let mut came_from: HashMap<(i32, i32), Option<((i32, i32), Direction)>> = HashMap::new();
+    type Parents = HashMap<(i32, i32), Option<((i32, i32), Direction)>>;
+    let mut came_from: Parents = HashMap::new();
     let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
     queue.push_back((start.x, start.y));
     came_from.insert((start.x, start.y), None);
@@ -559,9 +654,7 @@ fn parse_program(src: &str) -> Result<Vec<Action>, String> {
         // Normalize paren/comma syntax to whitespace so navigate_to(closest,
         // energy) and navigate_to closest energy both parse the same way.
         let normalized = code
-            .replace('(', " ")
-            .replace(')', " ")
-            .replace(',', " ")
+            .replace(['(', ')', ','], " ")
             .to_ascii_lowercase();
         let words: Vec<&str> = normalized.split_whitespace().collect();
         let action = match words.as_slice() {
@@ -606,6 +699,9 @@ fn advance_tick(mut tick: ResMut<Tick>) {
     tick.0 = tick.0.wrapping_add(1);
 }
 
+// Bevy's Query<Data, Filter> signatures are inherently nested; a type alias
+// per system body would be more noise than the inline form.
+#[allow(clippy::type_complexity)]
 fn step_workers(
     world: Res<World>,
     mut commands: Commands,
@@ -632,7 +728,7 @@ fn step_workers(
             Action::Move(dir) => {
                 // Turn-and-walk; if the destination is blocked the worker
                 // still turns toward the obstacle.
-                step_in_direction(&world, &mut *pos, &mut *facing, dir);
+                step_in_direction(&world, &mut pos, &mut facing, dir);
             }
             Action::Pickup => {
                 for (ent, epos) in &energy_q {
@@ -669,7 +765,7 @@ fn step_workers(
                         .unwrap_or_default();
                 }
                 if let Some(dir) = nav.plan.pop_front() {
-                    step_in_direction(&world, &mut *pos, &mut *facing, dir);
+                    step_in_direction(&world, &mut pos, &mut facing, dir);
                 }
                 // Hold pc on this instruction until the plan is fully drained.
                 advance_pc = nav.plan.is_empty();
@@ -876,6 +972,27 @@ mod tests {
         world.tiles[World::idx(x, y)] = t;
     }
 
+    // Standalone BFS so connectivity assertions aren't tautological with
+    // World::flood_from — if both broke the same way, the test would still pass.
+    fn bfs_reachable(world: &World, sx: i32, sy: i32) -> Vec<bool> {
+        let mut seen = vec![false; (GRID_W * GRID_H) as usize];
+        let mut queue = VecDeque::from([(sx, sy)]);
+        while let Some((x, y)) = queue.pop_front() {
+            if !(0..GRID_W).contains(&x) || !(0..GRID_H).contains(&y) {
+                continue;
+            }
+            let i = World::idx(x, y);
+            if seen[i] || !world.tiles[i].passable() {
+                continue;
+            }
+            seen[i] = true;
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                queue.push_back((x + dx, y + dy));
+            }
+        }
+        seen
+    }
+
     // --- find_path -----------------------------------------------------------
 
     #[test]
@@ -1054,5 +1171,57 @@ mod tests {
         assert_eq!(f.prev_yaw, 1.5);
         assert_eq!(f.current_yaw, 1.5);
     }
-}
 
+    // --- world generation ----------------------------------------------------
+
+    #[test]
+    fn start_cell_is_passable() {
+        let world = World::generate();
+        assert!(world.get(START.x, START.y).unwrap().passable());
+    }
+
+    #[test]
+    fn all_passable_cells_reachable_from_start() {
+        let world = World::generate();
+        let seen = bfs_reachable(&world, START.x, START.y);
+        for y in 0..GRID_H {
+            for x in 0..GRID_W {
+                let t = world.get(x, y).unwrap();
+                if t.passable() {
+                    assert!(
+                        seen[World::idx(x, y)],
+                        "passable cell ({x}, {y}) = {t:?} is unreachable from START"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_connected_links_isolated_islands() {
+        // Wall everywhere except two lone grass cells in opposite corners.
+        let mut tiles = vec![Terrain::Wall; (GRID_W * GRID_H) as usize];
+        tiles[World::idx(START.x, START.y)] = Terrain::Grass;
+        let far = (GRID_W - 1, GRID_H - 1);
+        tiles[World::idx(far.0, far.1)] = Terrain::Grass;
+
+        let mut world = World { tiles };
+        world.ensure_connected();
+
+        let seen = bfs_reachable(&world, START.x, START.y);
+        assert!(
+            seen[World::idx(far.0, far.1)],
+            "far corner should be reachable after ensure_connected"
+        );
+    }
+
+    #[test]
+    fn value_noise_stays_in_unit_interval() {
+        for y in -3..GRID_H + 3 {
+            for x in -3..GRID_W + 3 {
+                let n = value_noise(x, y);
+                assert!((0.0..=1.0).contains(&n), "value_noise({x},{y}) = {n}");
+            }
+        }
+    }
+}

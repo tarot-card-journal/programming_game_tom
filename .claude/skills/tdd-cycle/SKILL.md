@@ -33,19 +33,24 @@ If you wrote tests first, make sure they fail for the right reason before moving
 
 ### 2. Verify
 
-This step has **two parts**. Always attempt both:
+This step has **three parts**. Always attempt all three:
 
 **a. Automated test (preferred, but optional when impractical).**
 - For Rust: `#[test]` or `#[cfg(test)]` modules, `cargo test`.
 - For visual or interactive behavior (e.g. Bevy rendering, audio output, UI animations): an automated test usually does not exist that meaningfully verifies the change. Say so explicitly: *"No automated test fits — visual behavior."* Then move on.
 - For mixed cases (game logic that's visible but also has pure data shape): write the test for the pure-data part and verify the visual part by running.
 
-**b. Runtime verification (always).**
+**b. Lint check (always).**
+- `cargo clippy --all-targets -- -D warnings` must pass with zero warnings. CI enforces this on every PR, so catching lints locally avoids a round-trip.
+- Most lints are auto-fixable: `cargo clippy --fix --allow-dirty --all-targets`. Inspect the diff before keeping the fix.
+- If clippy flags something you genuinely want to keep (e.g. a Bevy query type), prefer a targeted `#[allow(...)]` over a crate-wide allow, and write a one-line comment naming the reason.
+
+**c. Runtime verification (always).**
 - `cargo build` to confirm the code compiles.
 - `cargo run` (or equivalent) and exercise the path. State what you observed.
 - If the change is visual and you can't observe it yourself (e.g. running inside a sandboxed agent), say so explicitly rather than claiming success.
 
-If both verifications pass, proceed to step 3. If something fails, debug back at step 1.
+If all three verifications pass, proceed to step 3. If something fails, debug back at step 1.
 
 ### 3. Refactor (mandatory)
 
