@@ -1,12 +1,13 @@
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
+use std::collections::{HashMap, VecDeque};
 
 const GRID_W: i32 = 20;
 const GRID_H: i32 = 15;
 const START: GridPos = GridPos { x: 5, y: 5 };
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Direction {
     North,
     South,
@@ -37,14 +38,26 @@ impl Direction {
 }
 
 #[derive(Copy, Clone, Debug)]
+enum NavQualifier {
+    Closest,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum Target {
+    Energy,
+    Base,
+}
+
+#[derive(Copy, Clone, Debug)]
 enum Action {
     Move(Direction),
     Wait,
     Pickup,
     Drop,
+    NavigateTo(NavQualifier, Target),
 }
 
-#[derive(Component, Copy, Clone, Debug)]
+#[derive(Component, Copy, Clone, Debug, PartialEq, Eq)]
 struct GridPos {
     x: i32,
     y: i32,
@@ -155,6 +168,14 @@ struct Base {
     stored: u32,
 }
 
+// Cached navigation plan. While `plan` is non-empty, NavigateTo holds the pc
+// and consumes one step per tick. Plan is recomputed lazily whenever it's
+// empty at the start of a NavigateTo execution.
+#[derive(Component, Default)]
+struct NavState {
+    plan: VecDeque<Direction>,
+}
+
 // Visual interpolation. prev is the world position at the previous fixed tick;
 // current is the world position at the latest fixed tick. The Update system
 // lerps Transform between them using Time<Fixed>::overstep_fraction().
@@ -203,16 +224,12 @@ struct Editor {
 }
 
 const DEFAULT_PROGRAM: &str = "\
-# one instruction per line
-# N S E W Wait  (case-insensitive)
-E
-E
-N
-N
-W
-W
-S
-S
+# Gather energy and deliver it home.
+# Comments start with '#'. One instruction per line.
+navigate_to(closest, energy)
+pickup
+navigate_to(closest, base)
+drop
 ";
 
 impl Default for Editor {
@@ -247,7 +264,13 @@ fn main() {
         .add_systems(EguiPrimaryContextPass, editor_ui)
         .add_systems(
             FixedUpdate,
-            (advance_tick, step_workers, update_move_anim).chain(),
+            (
+                advance_tick,
+                snapshot_anim_state,
+                step_workers,
+                sync_anim_current,
+            )
+                .chain(),
         )
         .run();
 }
@@ -390,6 +413,7 @@ fn setup(
             Worker,
             START,
             Inventory::default(),
+            NavState::default(),
             Program {
                 instructions: initial,
                 pc: 0,
@@ -439,6 +463,85 @@ fn lerp_yaw(prev: f32, current: f32, t: f32) -> f32 {
     prev + diff * t
 }
 
+// Try to walk one cell. Returns the new position if the destination is in
+// bounds and passable.
+fn try_walk(world: &World, pos: GridPos, dir: Direction) -> Option<GridPos> {
+    let (dx, dy) = dir.delta();
+    let nx = pos.x + dx;
+    let ny = pos.y + dy;
+    if matches!(world.get(nx, ny), Some(t) if t.passable()) {
+        Some(GridPos { x: nx, y: ny })
+    } else {
+        None
+    }
+}
+
+// Face the given direction and try to walk one cell. Centralizes the canonical
+// "one tick of motion" used by both Action::Move and the per-tick step of
+// Action::NavigateTo, so future motion verbs can't drift apart.
+fn step_in_direction(world: &World, pos: &mut GridPos, facing: &mut Facing, dir: Direction) {
+    facing.current_yaw = dir.yaw();
+    if let Some(new_pos) = try_walk(world, *pos, dir) {
+        *pos = new_pos;
+    }
+}
+
+// BFS from `start` over passable terrain. Returns the path to the first cell
+// satisfying `is_target` — which is also the closest such cell, since BFS on
+// unit-cost grids expands in order of distance. Returns None if no reachable
+// target exists; returns Some(empty) if the start cell itself is a target.
+fn find_path(
+    world: &World,
+    start: GridPos,
+    is_target: impl Fn(GridPos) -> bool,
+) -> Option<VecDeque<Direction>> {
+    if is_target(start) {
+        return Some(VecDeque::new());
+    }
+    // None at the start cell means "no parent"; Some((prev, dir)) elsewhere
+    // means "I was reached from prev by stepping `dir`."
+    let mut came_from: HashMap<(i32, i32), Option<((i32, i32), Direction)>> = HashMap::new();
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    queue.push_back((start.x, start.y));
+    came_from.insert((start.x, start.y), None);
+
+    const DIRS: [Direction; 4] = [
+        Direction::North,
+        Direction::South,
+        Direction::East,
+        Direction::West,
+    ];
+
+    while let Some((cx, cy)) = queue.pop_front() {
+        for dir in DIRS {
+            let (dx, dy) = dir.delta();
+            let nx = cx + dx;
+            let ny = cy + dy;
+            if came_from.contains_key(&(nx, ny)) {
+                continue;
+            }
+            let Some(t) = world.get(nx, ny) else { continue };
+            if !t.passable() {
+                continue;
+            }
+            came_from.insert((nx, ny), Some(((cx, cy), dir)));
+            if is_target(GridPos { x: nx, y: ny }) {
+                let mut path = VecDeque::new();
+                let mut cur = (nx, ny);
+                // flatten() collapses both "missing entry" and "start cell" to
+                // None, ending the walk at the root without a sentinel value.
+                while let Some(((px, py), d)) = came_from.get(&cur).copied().flatten() {
+                    path.push_front(d);
+                    cur = (px, py);
+                }
+                return Some(path);
+            }
+            queue.push_back((nx, ny));
+        }
+    }
+    None
+}
+
 // Grid cell (gx, gy) maps to world (x, z). Y is up in 3D and reserved for height.
 fn grid_to_world(gx: i32, gy: i32) -> (f32, f32) {
     let ox = -(GRID_W as f32) / 2.0 + 0.5;
@@ -449,19 +552,47 @@ fn grid_to_world(gx: i32, gy: i32) -> (f32, f32) {
 fn parse_program(src: &str) -> Result<Vec<Action>, String> {
     let mut out = Vec::new();
     for (i, line) in src.lines().enumerate() {
-        let trimmed = line.split('#').next().unwrap_or("").trim();
-        if trimmed.is_empty() {
+        let code = line.split('#').next().unwrap_or("").trim();
+        if code.is_empty() {
             continue;
         }
-        let action = match trimmed.to_ascii_lowercase().as_str() {
-            "n" | "north" | "up" => Action::Move(Direction::North),
-            "s" | "south" | "down" => Action::Move(Direction::South),
-            "e" | "east" | "right" => Action::Move(Direction::East),
-            "w" | "west" | "left" => Action::Move(Direction::West),
-            "wait" | "noop" => Action::Wait,
-            "pickup" | "grab" | "take" => Action::Pickup,
-            "drop" | "deposit" | "deliver" => Action::Drop,
-            other => return Err(format!("line {}: unknown instruction '{}'", i + 1, other)),
+        // Normalize paren/comma syntax to whitespace so navigate_to(closest,
+        // energy) and navigate_to closest energy both parse the same way.
+        let normalized = code
+            .replace('(', " ")
+            .replace(')', " ")
+            .replace(',', " ")
+            .to_ascii_lowercase();
+        let words: Vec<&str> = normalized.split_whitespace().collect();
+        let action = match words.as_slice() {
+            ["n"] | ["north"] | ["up"] => Action::Move(Direction::North),
+            ["s"] | ["south"] | ["down"] => Action::Move(Direction::South),
+            ["e"] | ["east"] | ["right"] => Action::Move(Direction::East),
+            ["w"] | ["west"] | ["left"] => Action::Move(Direction::West),
+            ["wait"] | ["noop"] => Action::Wait,
+            ["pickup"] | ["grab"] | ["take"] => Action::Pickup,
+            ["drop"] | ["deposit"] | ["deliver"] => Action::Drop,
+            [nav, q, t] if matches!(*nav, "navigate_to" | "goto" | "nav") => {
+                let qualifier = match *q {
+                    "closest" => NavQualifier::Closest,
+                    other => {
+                        return Err(format!(
+                            "line {}: unknown nav qualifier '{}'",
+                            i + 1,
+                            other
+                        ))
+                    }
+                };
+                let target = match *t {
+                    "energy" => Target::Energy,
+                    "base" => Target::Base,
+                    other => {
+                        return Err(format!("line {}: unknown nav target '{}'", i + 1, other))
+                    }
+                };
+                Action::NavigateTo(qualifier, target)
+            }
+            _ => return Err(format!("line {}: unknown instruction '{}'", i + 1, code)),
         };
         out.push(action);
     }
@@ -481,32 +612,31 @@ fn step_workers(
     energy_q: Query<(Entity, &GridPos), (With<EnergyNode>, Without<Worker>, Without<Base>)>,
     mut base_q: Query<(&GridPos, &mut Base), (Without<Worker>, Without<EnergyNode>)>,
     mut workers: Query<
-        (&mut GridPos, &mut Program, &mut Facing, &mut Inventory),
+        (
+            &mut GridPos,
+            &mut Program,
+            &mut Facing,
+            &mut Inventory,
+            &mut NavState,
+        ),
         (With<Worker>, Without<EnergyNode>, Without<Base>),
     >,
 ) {
-    for (mut pos, mut prog, mut facing, mut inv) in &mut workers {
+    for (mut pos, mut prog, mut facing, mut inv, mut nav) in &mut workers {
         if prog.instructions.is_empty() {
             continue;
         }
         let action = prog.instructions[prog.pc];
+        let mut advance_pc = true;
         match action {
             Action::Move(dir) => {
-                // Always turn to face the direction — even if the move is
-                // blocked, the worker turns toward the obstacle.
-                facing.prev_yaw = facing.current_yaw;
-                facing.current_yaw = dir.yaw();
-                let (dx, dy) = dir.delta();
-                let nx = pos.x + dx;
-                let ny = pos.y + dy;
-                if matches!(world.get(nx, ny), Some(t) if t.passable()) {
-                    pos.x = nx;
-                    pos.y = ny;
-                }
+                // Turn-and-walk; if the destination is blocked the worker
+                // still turns toward the obstacle.
+                step_in_direction(&world, &mut *pos, &mut *facing, dir);
             }
             Action::Pickup => {
                 for (ent, epos) in &energy_q {
-                    if epos.x == pos.x && epos.y == pos.y {
+                    if *epos == *pos {
                         commands.entity(ent).despawn();
                         inv.energy += 1;
                         break;
@@ -516,7 +646,7 @@ fn step_workers(
             Action::Drop => {
                 if inv.energy > 0 {
                     for (bpos, mut base) in &mut base_q {
-                        if bpos.x == pos.x && bpos.y == pos.y {
+                        if *bpos == *pos {
                             base.stored += inv.energy;
                             inv.energy = 0;
                             break;
@@ -525,8 +655,29 @@ fn step_workers(
                 }
             }
             Action::Wait => {}
+            Action::NavigateTo(_qualifier, target) => {
+                // Lazy plan: only recompute when we have no cached steps.
+                if nav.plan.is_empty() {
+                    let targets: Vec<GridPos> = match target {
+                        Target::Energy => energy_q.iter().map(|(_, p)| *p).collect(),
+                        Target::Base => base_q.iter().map(|(p, _)| *p).collect(),
+                    };
+                    // find_path with an empty target set returns None, which
+                    // unwrap_or_default collapses to an empty plan — same as
+                    // "no path found", so no separate empty-guard is needed.
+                    nav.plan = find_path(&world, *pos, |p| targets.contains(&p))
+                        .unwrap_or_default();
+                }
+                if let Some(dir) = nav.plan.pop_front() {
+                    step_in_direction(&world, &mut *pos, &mut *facing, dir);
+                }
+                // Hold pc on this instruction until the plan is fully drained.
+                advance_pc = nav.plan.is_empty();
+            }
         }
-        prog.pc = (prog.pc + 1) % prog.instructions.len();
+        if advance_pc {
+            prog.pc = (prog.pc + 1) % prog.instructions.len();
+        }
     }
 }
 
@@ -603,12 +754,28 @@ fn spin_energy(time: Res<Time>, mut q: Query<&mut Transform, With<EnergyNode>>) 
     }
 }
 
-// Runs in FixedUpdate after step_workers. Rolls prev=current and writes the
-// new current whenever GridPos changed this tick.
-fn update_move_anim(mut q: Query<(&GridPos, &mut MoveAnim), Changed<GridPos>>) {
+// Runs in FixedUpdate BEFORE step_workers. Snapshots the previous-frame state
+// of every interpolated component, so step_workers only has to write "current"
+// values. Doing this unconditionally is what prevents the visual "pop-back"
+// when a tick doesn't change position or facing (e.g. Pickup, Drop, Wait).
+fn snapshot_anim_state(
+    mut anim_q: Query<&mut MoveAnim>,
+    mut facing_q: Query<&mut Facing>,
+) {
+    for mut a in &mut anim_q {
+        a.prev = a.current;
+    }
+    for mut f in &mut facing_q {
+        f.prev_yaw = f.current_yaw;
+    }
+}
+
+// Runs in FixedUpdate AFTER step_workers. Re-derives anim.current from the
+// (possibly updated) GridPos. Runs unconditionally — when GridPos didn't
+// change, current ends up equal to prev and interpolation is a no-op.
+fn sync_anim_current(mut q: Query<(&GridPos, &mut MoveAnim)>) {
     for (pos, mut anim) in &mut q {
         let (x, z) = grid_to_world(pos.x, pos.y);
-        anim.prev = anim.current;
         anim.current = Vec3::new(x, anim.current.y, z);
     }
 }
@@ -643,7 +810,9 @@ fn editor_ui(
         .show(ctx, |ui| {
             ui.heading("Worker Program");
             ui.label("One instruction per line. Tokens:");
-            ui.monospace("N S E W Wait Pickup Drop  (# = comment)");
+            ui.monospace("N S E W Wait Pickup Drop");
+            ui.monospace("navigate_to(closest, energy|base)");
+            ui.label("'#' starts a comment.");
             ui.separator();
 
             ui.add(
@@ -692,3 +861,198 @@ fn editor_ui(
             ui.monospace("Scroll    — zoom");
         });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat_grass_world() -> World {
+        World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        }
+    }
+
+    fn place(world: &mut World, x: i32, y: i32, t: Terrain) {
+        world.tiles[World::idx(x, y)] = t;
+    }
+
+    // --- find_path -----------------------------------------------------------
+
+    #[test]
+    fn find_path_returns_empty_when_start_is_goal() {
+        let w = flat_grass_world();
+        let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == GridPos { x: 5, y: 5 });
+        assert_eq!(p, Some(VecDeque::new()));
+    }
+
+    #[test]
+    fn find_path_walks_a_straight_line_on_open_grass() {
+        let w = flat_grass_world();
+        let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == GridPos { x: 8, y: 5 }).unwrap();
+        assert_eq!(p, VecDeque::from(vec![Direction::East; 3]));
+    }
+
+    #[test]
+    fn find_path_detours_around_a_wall() {
+        let mut w = flat_grass_world();
+        // Single-cell wall directly east of (5,5); detour must go north or south.
+        place(&mut w, 6, 5, Terrain::Wall);
+        let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == GridPos { x: 7, y: 5 }).unwrap();
+        // Manhattan distance is 2; the detour adds 2 extra steps.
+        assert_eq!(p.len(), 4);
+    }
+
+    #[test]
+    fn find_path_returns_none_when_target_is_walled_in() {
+        let mut w = flat_grass_world();
+        for (dx, dy) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
+            place(&mut w, 7 + dx, 5 + dy, Terrain::Wall);
+        }
+        let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == GridPos { x: 7, y: 5 });
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn find_path_returns_none_when_no_cell_matches() {
+        let w = flat_grass_world();
+        let p = find_path(&w, GridPos { x: 5, y: 5 }, |_| false);
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn find_path_picks_the_closest_of_multiple_targets() {
+        let w = flat_grass_world();
+        let near = GridPos { x: 5, y: 6 };
+        let far = GridPos { x: 5, y: 12 };
+        let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == near || p == far).unwrap();
+        // BFS expands by distance, so the 1-step target wins over the 7-step one.
+        assert_eq!(p, VecDeque::from(vec![Direction::North]));
+    }
+
+    // --- try_walk ------------------------------------------------------------
+
+    #[test]
+    fn try_walk_moves_into_grass() {
+        let w = flat_grass_world();
+        assert_eq!(
+            try_walk(&w, GridPos { x: 5, y: 5 }, Direction::East),
+            Some(GridPos { x: 6, y: 5 })
+        );
+    }
+
+    #[test]
+    fn try_walk_is_blocked_by_walls() {
+        let mut w = flat_grass_world();
+        place(&mut w, 6, 5, Terrain::Wall);
+        assert_eq!(try_walk(&w, GridPos { x: 5, y: 5 }, Direction::East), None);
+    }
+
+    #[test]
+    fn try_walk_is_blocked_by_water() {
+        let mut w = flat_grass_world();
+        place(&mut w, 6, 5, Terrain::Water);
+        assert_eq!(try_walk(&w, GridPos { x: 5, y: 5 }, Direction::East), None);
+    }
+
+    #[test]
+    fn try_walk_is_blocked_at_grid_boundary() {
+        let w = flat_grass_world();
+        assert_eq!(
+            try_walk(&w, GridPos { x: GRID_W - 1, y: 5 }, Direction::East),
+            None
+        );
+    }
+
+    // --- snapshot + sync (interpolation pop-back regression) -----------------
+
+    fn run_snapshot_sync_once(world: &mut bevy::ecs::world::World) {
+        let mut schedule = Schedule::default();
+        schedule.add_systems((snapshot_anim_state, sync_anim_current).chain());
+        schedule.run(world);
+    }
+
+    #[test]
+    fn interpolation_does_not_pop_back_when_grid_pos_unchanged() {
+        let mut world = bevy::ecs::world::World::new();
+        let (x, z) = grid_to_world(1, 2);
+        let initial = Vec3::new(x, 0.45, z);
+        // Seed with a stale prev (simulating "worker just finished a move last tick").
+        let entity = world
+            .spawn((
+                GridPos { x: 1, y: 2 },
+                MoveAnim {
+                    prev: Vec3::new(99.0, 0.45, 99.0),
+                    current: initial,
+                },
+            ))
+            .id();
+
+        run_snapshot_sync_once(&mut world);
+
+        let anim = world.get::<MoveAnim>(entity).unwrap();
+        // After the snapshot+sync cycle on an unchanged GridPos, prev and current
+        // must coincide so the next interpolation lerp is a no-op (no pop-back).
+        assert_eq!(anim.prev, initial);
+        assert_eq!(anim.current, initial);
+    }
+
+    #[test]
+    fn interpolation_tracks_motion_across_one_tick() {
+        let mut world = bevy::ecs::world::World::new();
+        let (x0, z0) = grid_to_world(1, 2);
+        let initial = Vec3::new(x0, 0.45, z0);
+        let entity = world
+            .spawn((
+                GridPos { x: 1, y: 2 },
+                MoveAnim {
+                    prev: initial,
+                    current: initial,
+                },
+            ))
+            .id();
+
+        // First tick: nothing has moved — confirm steady-state.
+        run_snapshot_sync_once(&mut world);
+        let anim = world.get::<MoveAnim>(entity).unwrap();
+        assert_eq!(anim.prev, initial);
+        assert_eq!(anim.current, initial);
+
+        // Simulate step_workers moving the worker east between snapshot and sync.
+        // The schedule runs both systems in one pass, so we mutate GridPos first
+        // and let the next cycle observe it.
+        world.get_mut::<GridPos>(entity).unwrap().x = 2;
+        run_snapshot_sync_once(&mut world);
+
+        let (x1, z1) = grid_to_world(2, 2);
+        let anim = world.get::<MoveAnim>(entity).unwrap();
+        assert_eq!(anim.prev, initial, "prev must be where we were last tick");
+        assert_eq!(
+            anim.current,
+            Vec3::new(x1, 0.45, z1),
+            "current must reflect the new GridPos"
+        );
+    }
+
+    #[test]
+    fn snapshot_pins_facing_prev_to_current() {
+        let mut world = bevy::ecs::world::World::new();
+        // Seed with a stale prev_yaw, as would happen one tick after a Move.
+        let entity = world
+            .spawn(Facing {
+                prev_yaw: 0.0,
+                current_yaw: 1.5,
+            })
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(snapshot_anim_state);
+        schedule.run(&mut world);
+
+        let f = world.get::<Facing>(entity).unwrap();
+        // Snapshot must collapse prev onto current so interpolation is a no-op
+        // until step_workers writes a new current_yaw.
+        assert_eq!(f.prev_yaw, 1.5);
+        assert_eq!(f.current_yaw, 1.5);
+    }
+}
+
