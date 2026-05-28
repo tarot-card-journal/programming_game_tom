@@ -26,6 +26,8 @@ jobs:
             pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
 
       - uses: mozilla-actions/sccache-action@v0.0.10
@@ -37,6 +39,7 @@ jobs:
           # sccache's per-unit hashing — disable it on CI.
           echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
 
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
       - name: sccache stats

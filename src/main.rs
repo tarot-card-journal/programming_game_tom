@@ -1,3 +1,7 @@
+// Bevy systems' Query types are inherently nested and trip type_complexity;
+// extracting type aliases for each one is noise without real clarity gain.
+#![allow(clippy::type_complexity)]
+
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
@@ -125,7 +129,7 @@ impl World {
     }
 
     fn get(&self, x: i32, y: i32) -> Option<Terrain> {
-        if x < 0 || x >= GRID_W || y < 0 || y >= GRID_H {
+        if !(0..GRID_W).contains(&x) || !(0..GRID_H).contains(&y) {
             return None;
         }
         Some(self.tiles[Self::idx(x, y)])
@@ -172,7 +176,7 @@ impl World {
         let mut visited = vec![false; (GRID_W * GRID_H) as usize];
         let mut stack = vec![(sx, sy)];
         while let Some((x, y)) = stack.pop() {
-            if x < 0 || x >= GRID_W || y < 0 || y >= GRID_H {
+            if !(0..GRID_W).contains(&x) || !(0..GRID_H).contains(&y) {
                 continue;
             }
             let i = Self::idx(x, y);
@@ -653,9 +657,7 @@ fn parse_program(src: &str) -> Result<Vec<Action>, String> {
         // Normalize paren/comma syntax to whitespace so navigate_to(closest,
         // energy) and navigate_to closest energy both parse the same way.
         let normalized = code
-            .replace('(', " ")
-            .replace(')', " ")
-            .replace(',', " ")
+            .replace(['(', ')', ','], " ")
             .to_ascii_lowercase();
         let words: Vec<&str> = normalized.split_whitespace().collect();
         let action = match words.as_slice() {
@@ -726,7 +728,7 @@ fn step_workers(
             Action::Move(dir) => {
                 // Turn-and-walk; if the destination is blocked the worker
                 // still turns toward the obstacle.
-                step_in_direction(&world, &mut *pos, &mut *facing, dir);
+                step_in_direction(&world, &mut pos, &mut facing, dir);
             }
             Action::Pickup => {
                 for (ent, epos) in &energy_q {
@@ -763,7 +765,7 @@ fn step_workers(
                         .unwrap_or_default();
                 }
                 if let Some(dir) = nav.plan.pop_front() {
-                    step_in_direction(&world, &mut *pos, &mut *facing, dir);
+                    step_in_direction(&world, &mut pos, &mut facing, dir);
                 }
                 // Hold pc on this instruction until the plan is fully drained.
                 advance_pc = nav.plan.is_empty();
@@ -976,7 +978,7 @@ mod tests {
         let mut seen = vec![false; (GRID_W * GRID_H) as usize];
         let mut queue = VecDeque::from([(sx, sy)]);
         while let Some((x, y)) = queue.pop_front() {
-            if x < 0 || x >= GRID_W || y < 0 || y >= GRID_H {
+            if !(0..GRID_W).contains(&x) || !(0..GRID_H).contains(&y) {
                 continue;
             }
             let i = World::idx(x, y);
