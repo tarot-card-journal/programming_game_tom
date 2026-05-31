@@ -47,22 +47,23 @@ impl Direction {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum NavQualifier {
     Closest,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Target {
-    Energy,
+    Resource(ResourceKind),
     Base,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Action {
     Move(Direction),
     Wait,
-    Pickup,
+    // None = pick any resource on the tile; Some(kind) = filter by kind.
+    Pickup(Option<ResourceKind>),
     Drop,
     NavigateTo(NavQualifier, Target),
 }
@@ -74,6 +75,97 @@ enum Action {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum TileAction {
     Pickup,
+}
+
+// Collectible resource kinds. #[repr(usize)] so `kind as usize` indexes the
+// per-kind arrays on Inventory and Base — keeps pickup/drop allocation-free
+// and avoids parallel `if let` branches per resource type.
+#[repr(usize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ResourceKind {
+    Energy = 0,
+    Grass = 1,
+    Wood = 2,
+}
+
+impl ResourceKind {
+    // ALL is the single source of truth for the kind list; COUNT derives
+    // from it so the two can't drift if a new variant is added.
+    const ALL: [Self; 3] = [Self::Energy, Self::Grass, Self::Wood];
+    const COUNT: usize = Self::ALL.len();
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Energy => "energy",
+            Self::Grass => "grass",
+            Self::Wood => "wood",
+        }
+    }
+
+    fn from_token(token: &str) -> Option<ResourceKind> {
+        match token {
+            "energy" => Some(Self::Energy),
+            "grass" => Some(Self::Grass),
+            "wood" => Some(Self::Wood),
+            _ => None,
+        }
+    }
+
+    // Per-kind material parameters. Kept here (rather than positionally in
+    // ResourceAssets::build) so the kind → material mapping is checked by
+    // match exhaustiveness — adding a new variant forces a deliberate choice
+    // instead of silently shifting which color belongs to which kind.
+    fn material_spec(self) -> StandardMaterial {
+        match self {
+            Self::Energy => StandardMaterial {
+                base_color: Color::srgb(1.0, 0.85, 0.15),
+                emissive: LinearRgba::new(0.9, 0.65, 0.1, 1.0),
+                perceptual_roughness: 0.3,
+                metallic: 0.2,
+                ..default()
+            },
+            Self::Grass => StandardMaterial {
+                base_color: Color::srgb(0.35, 0.78, 0.30),
+                emissive: LinearRgba::new(0.04, 0.10, 0.03, 1.0),
+                perceptual_roughness: 0.85,
+                ..default()
+            },
+            Self::Wood => StandardMaterial {
+                base_color: Color::srgb(0.42, 0.27, 0.13),
+                perceptual_roughness: 0.9,
+                ..default()
+            },
+        }
+    }
+
+    // Per-kind mesh shape, ground-level Y, and base Z-rotation. Same rationale
+    // as material_spec — match arms keep kind → look correspondence explicit.
+    fn visual_spec(self) -> ResourceVisualSpec {
+        use std::f32::consts::FRAC_PI_4;
+        match self {
+            Self::Energy => ResourceVisualSpec {
+                mesh_size: Vec3::splat(0.32),
+                y: 0.35,
+                rotation_y: FRAC_PI_4,
+            },
+            Self::Grass => ResourceVisualSpec {
+                mesh_size: Vec3::new(0.5, 0.18, 0.5),
+                y: 0.14,
+                rotation_y: 0.0,
+            },
+            Self::Wood => ResourceVisualSpec {
+                mesh_size: Vec3::new(0.6, 0.22, 0.22),
+                y: 0.16,
+                rotation_y: 0.0,
+            },
+        }
+    }
+}
+
+struct ResourceVisualSpec {
+    mesh_size: Vec3,
+    y: f32,
+    rotation_y: f32,
 }
 
 #[derive(Component, Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -268,35 +360,79 @@ struct Program {
 #[derive(Component)]
 struct Worker;
 
-#[derive(Component)]
-struct EnergyNode;
+// Named ResourceNode (not Resource) to avoid shadowing bevy::prelude::Resource,
+// and to mirror the original EnergyNode component this generalizes.
+#[derive(Component, Copy, Clone)]
+struct ResourceNode {
+    kind: ResourceKind,
+}
 
+// One of the worker's carry-indicator child entities. The usize is the queue
+// index this slot mirrors (0 = oldest, 1 = newest).
+#[derive(Component, Copy, Clone)]
+struct CarrySlot(usize);
+
+// Local-Y position of each carry slot above the worker. Array length is tied
+// to Inventory::CAPACITY so a capacity change is a compile error here, not a
+// silently-missing slot at runtime.
+const CARRY_SLOT_Y: [f32; Inventory::CAPACITY] = [0.55, 0.85];
+
+// FIFO queue of carried resources, bounded to CAPACITY. On overflow, `push`
+// returns the evicted oldest entry to the caller — step_workers' Pickup arm
+// respawns it onto the worker's tile as a fresh ResourceNode so it remains
+// collectible.
 #[derive(Component, Default)]
 struct Inventory {
-    energy: u32,
+    queue: VecDeque<ResourceKind>,
+}
+
+impl Inventory {
+    const CAPACITY: usize = 2;
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    // Push `kind` onto the back of the queue. Returns the kind that was
+    // evicted from the front, if the queue was already at capacity, so callers
+    // can decide what to do with it (e.g. respawn it onto the worker's tile).
+    fn push(&mut self, kind: ResourceKind) -> Option<ResourceKind> {
+        self.queue.push_back(kind);
+        if self.queue.len() > Self::CAPACITY {
+            self.queue.pop_front()
+        } else {
+            None
+        }
+    }
+
+    fn drain_into(&mut self, counts: &mut [u32; ResourceKind::COUNT]) {
+        while let Some(k) = self.queue.pop_front() {
+            counts[k as usize] += 1;
+        }
+    }
 }
 
 #[derive(Component, Default)]
 struct Base {
-    stored: u32,
+    stored: [u32; ResourceKind::COUNT],
 }
 
 // Cached navigation plan. While `plan` is non-empty, NavigateTo holds the pc
 // and consumes one step per tick. Plan is recomputed lazily whenever it's
 // empty at the start of a NavigateTo execution.
 //
-// `energy_target` is the tile this worker has reserved while pathing toward
-// it. step_workers consults every worker's claim before picking a fresh
-// target so two workers don't converge on the same node. A claim is set
-// only when navigate_to(energy) computes a non-empty path — if the worker
-// is already standing on an energy tile no claim is needed (the next
-// Pickup fires immediately). The claim is released when the worker picks
-// up at the reserved tile, re-plans navigate_to, or the program is
+// `reserved_tile` is the tile this worker has reserved while pathing toward
+// a resource. step_workers consults every worker's claim before picking a
+// fresh target so two workers don't converge on the same node. A claim is
+// set only when navigate_to(resource) computes a non-empty path — if the
+// worker is already standing on the target tile no claim is needed (the
+// next Pickup fires immediately). The claim is released when the worker
+// picks up at the reserved tile, re-plans navigate_to, or the program is
 // recompiled.
 #[derive(Component, Default)]
 struct NavState {
     plan: VecDeque<Direction>,
-    energy_target: Option<GridPos>,
+    reserved_tile: Option<GridPos>,
 }
 
 // Visual interpolation. prev is the world position at the previous fixed tick;
@@ -337,6 +473,66 @@ impl OrbitCamera {
     }
 }
 
+// Shared per-kind rendering bundle (mesh + material + ground placement). Used
+// by the world-scatter loop, the eviction-respawn path in step_workers, and
+// the carry indicator on each worker — one source of truth so a respawned
+// resource matches its original visual exactly.
+struct ResourceVisual {
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+    y: f32,
+    rotation: Quat,
+}
+
+#[derive(Resource)]
+struct ResourceAssets {
+    visuals: [ResourceVisual; ResourceKind::COUNT],
+}
+
+impl ResourceAssets {
+    fn build(meshes: &mut Assets<Mesh>, materials: &mut Assets<StandardMaterial>) -> Self {
+        Self {
+            visuals: ResourceKind::ALL.map(|kind| {
+                let spec = kind.visual_spec();
+                ResourceVisual {
+                    mesh: meshes.add(Cuboid::from_size(spec.mesh_size)),
+                    material: materials.add(kind.material_spec()),
+                    y: spec.y,
+                    rotation: Quat::from_rotation_y(spec.rotation_y),
+                }
+            }),
+        }
+    }
+
+    fn visual(&self, kind: ResourceKind) -> &ResourceVisual {
+        &self.visuals[kind as usize]
+    }
+
+    fn material_for(&self, kind: ResourceKind) -> Handle<StandardMaterial> {
+        self.visual(kind).material.clone()
+    }
+}
+
+// Spawn a resource node at the given grid position using the shared visual.
+// Used both during initial world scatter and when an inventory overflow
+// evicts a resource back to the worker's tile.
+fn spawn_resource_node(
+    commands: &mut Commands,
+    assets: &ResourceAssets,
+    kind: ResourceKind,
+    pos: GridPos,
+) {
+    let v = assets.visual(kind);
+    let (x, z) = grid_to_world(pos.x, pos.y);
+    commands.spawn((
+        ResourceNode { kind },
+        pos,
+        Mesh3d(v.mesh.clone()),
+        MeshMaterial3d(v.material.clone()),
+        Transform::from_xyz(x, v.y, z).with_rotation(v.rotation),
+    ));
+}
+
 #[derive(Resource, Default)]
 struct Tick(u64);
 
@@ -347,10 +543,15 @@ struct Editor {
 }
 
 const DEFAULT_PROGRAM: &str = "\
-# Gather energy and deliver it home.
+# Gather energy, grass, and wood, then deliver them home.
 # Comments start with '#'. One instruction per line.
+# `pickup(kind)` filters by kind — useful when tiles overlap.
 navigate_to(closest, energy)
-pickup
+pickup(energy)
+navigate_to(closest, grass)
+pickup(grass)
+navigate_to(closest, wood)
+pickup(wood)
 navigate_to(closest, base)
 drop
 ";
@@ -382,7 +583,12 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (orbit_camera_input, interpolate_transforms, spin_energy),
+            (
+                orbit_camera_input,
+                interpolate_transforms,
+                spin_energy,
+                update_carry_display,
+            ),
         )
         .add_systems(EguiPrimaryContextPass, editor_ui)
         .add_systems(
@@ -463,16 +669,25 @@ fn setup(
         }
     }
 
-    // Scatter energy nodes on grass tiles (skip the worker's start cell).
-    let energy_mesh = meshes.add(Cuboid::new(0.32, 0.32, 0.32));
-    let energy_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.85, 0.15),
-        emissive: LinearRgba::new(0.9, 0.65, 0.1, 1.0),
-        perceptual_roughness: 0.3,
-        metallic: 0.2,
-        ..default()
-    });
-    let mut energy_positions: HashSet<GridPos> = HashSet::new();
+    // Per-kind world-scatter rates. Visuals come from ResourceAssets; only
+    // the placement tuning (salt + chance) lives here, since respawned
+    // resources don't go through a placement roll.
+    //
+    // Salts are arbitrary 32-bit constants; the originals are the two halves
+    // of 0x9E3779B9 (golden-ratio mix used by xorshift) for energy. Grass and
+    // wood use unrelated values to keep the three rolls decorrelated.
+    let resource_assets = ResourceAssets::build(&mut meshes, &mut materials);
+    let spawn_table: [(ResourceKind, i32, i32, u32); ResourceKind::COUNT] = [
+        (ResourceKind::Energy, 0x9e37, 0x79b9, 8),
+        (ResourceKind::Grass, 0x51a5, 0xb47c, 12),
+        (ResourceKind::Wood, 0x2c8d, 0xe6f1, 8),
+    ];
+
+    // Track tiles that received any resource so worker spawn positions can
+    // avoid them (otherwise a worker would trigger an instant pickup on tick
+    // 1). A tile may appear here multiple times when kinds overlap — fine,
+    // the HashSet de-dupes.
+    let mut resource_positions: HashSet<GridPos> = HashSet::new();
     for gy in 0..GRID_H {
         for gx in 0..GRID_W {
             if (gx, gy) == (START.x, START.y) {
@@ -481,29 +696,20 @@ fn setup(
             if !matches!(world.get(gx, gy), Some(Terrain::Grass)) {
                 continue;
             }
-            // Salts are the two halves of 0x9E3779B9 (golden-ratio mix constant
-            // used by xorshift hashes). Reusing tile_hash with a different
-            // seed decorrelates resource placement from terrain choice.
-            if tile_hash(gx ^ 0x9e37, gy ^ 0x79b9) % 100 < 8 {
-                let (x, z) = grid_to_world(gx, gy);
-                let pos = GridPos { x: gx, y: gy };
-                energy_positions.insert(pos);
-                commands.spawn((
-                    EnergyNode,
-                    pos,
-                    Mesh3d(energy_mesh.clone()),
-                    MeshMaterial3d(energy_mat.clone()),
-                    Transform::from_xyz(x, 0.35, z)
-                        .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_4)),
-                ));
+            for &(kind, salt_x, salt_y, chance) in &spawn_table {
+                if tile_hash(gx ^ salt_x, gy ^ salt_y) % 100 < chance {
+                    let pos = GridPos { x: gx, y: gy };
+                    resource_positions.insert(pos);
+                    spawn_resource_node(&mut commands, &resource_assets, kind, pos);
+                }
             }
         }
     }
 
     // Compute spawn cells before moving `world` into the ECS resource. Skip
-    // tiles that already hold an energy node so workers don't materialise on
-    // top of one (which would trigger an instant pickup on tick 1).
-    let worker_starts = worker_start_positions(&world, START, NUM_WORKERS, &energy_positions);
+    // tiles that already hold a resource so workers don't materialise on top
+    // of one (which would trigger an instant pickup on tick 1).
+    let worker_starts = worker_start_positions(&world, START, NUM_WORKERS, &resource_positions);
     commands.insert_resource(world);
 
     // Base — sits at the worker's start cell so home == origin.
@@ -547,10 +753,17 @@ fn setup(
             perceptual_roughness: 0.6,
             ..default()
         }),
+        // Carry-slot mesh is uniform across kinds; update_carry_display swaps
+        // the material per slot from ResourceAssets each frame. Energy's
+        // material is just a placeholder so the slot has a valid handle while
+        // it's still hidden.
+        slot_mesh: meshes.add(Cuboid::new(0.22, 0.22, 0.22)),
+        slot_placeholder_mat: resource_assets.material_for(ResourceKind::Energy),
     };
     for grid_pos in worker_starts {
         spawn_worker(&mut commands, grid_pos, initial.clone(), initial_yaw, &assets);
     }
+    commands.insert_resource(resource_assets);
 }
 
 // Mesh/material handles shared across every worker spawn. Bundling them keeps
@@ -561,6 +774,8 @@ struct WorkerAssets {
     body_mat: Handle<StandardMaterial>,
     nose_mesh: Handle<Mesh>,
     nose_mat: Handle<StandardMaterial>,
+    slot_mesh: Handle<Mesh>,
+    slot_placeholder_mat: Handle<StandardMaterial>,
 }
 
 fn spawn_worker(
@@ -605,6 +820,18 @@ fn spawn_worker(
                 MeshMaterial3d(assets.nose_mat.clone()),
                 Transform::from_xyz(0.0, 0.05, -0.45),
             ));
+            // Carry-slot indicators above the worker. Hidden until the worker
+            // picks something up; update_carry_display swaps the material and
+            // visibility from the Inventory queue each frame.
+            for (slot, &slot_y) in CARRY_SLOT_Y.iter().enumerate().take(Inventory::CAPACITY) {
+                p.spawn((
+                    CarrySlot(slot),
+                    Mesh3d(assets.slot_mesh.clone()),
+                    MeshMaterial3d(assets.slot_placeholder_mat.clone()),
+                    Transform::from_xyz(0.0, slot_y, 0.0),
+                    Visibility::Hidden,
+                ));
+            }
         });
 }
 
@@ -769,7 +996,13 @@ fn parse_program(src: &str) -> Result<Vec<Action>, String> {
             ["e"] | ["east"] | ["right"] => Action::Move(Direction::East),
             ["w"] | ["west"] | ["left"] => Action::Move(Direction::West),
             ["wait"] | ["noop"] => Action::Wait,
-            ["pickup"] | ["grab"] | ["take"] => Action::Pickup,
+            ["pickup"] | ["grab"] | ["take"] => Action::Pickup(None),
+            ["pickup", k] | ["grab", k] | ["take", k] => {
+                let kind = ResourceKind::from_token(k).ok_or_else(|| {
+                    format!("line {}: unknown resource kind '{}'", i + 1, k)
+                })?;
+                Action::Pickup(Some(kind))
+            }
             ["drop"] | ["deposit"] | ["deliver"] => Action::Drop,
             [nav, q, t] if matches!(*nav, "navigate_to" | "goto" | "nav") => {
                 let qualifier = match *q {
@@ -782,12 +1015,12 @@ fn parse_program(src: &str) -> Result<Vec<Action>, String> {
                         ))
                     }
                 };
-                let target = match *t {
-                    "energy" => Target::Energy,
-                    "base" => Target::Base,
-                    other => {
-                        return Err(format!("line {}: unknown nav target '{}'", i + 1, other))
-                    }
+                let target = if *t == "base" {
+                    Target::Base
+                } else if let Some(kind) = ResourceKind::from_token(t) {
+                    Target::Resource(kind)
+                } else {
+                    return Err(format!("line {}: unknown nav target '{}'", i + 1, t));
                 };
                 Action::NavigateTo(qualifier, target)
             }
@@ -810,9 +1043,13 @@ fn advance_tick(mut tick: ResMut<Tick>) {
 #[allow(clippy::type_complexity)]
 fn step_workers(
     world: Res<World>,
+    assets: Res<ResourceAssets>,
     mut commands: Commands,
-    energy_q: Query<(Entity, &GridPos), (With<EnergyNode>, Without<Worker>, Without<Base>)>,
-    mut base_q: Query<(&GridPos, &mut Base), (Without<Worker>, Without<EnergyNode>)>,
+    resource_q: Query<
+        (Entity, &GridPos, &ResourceNode),
+        (With<ResourceNode>, Without<Worker>, Without<Base>),
+    >,
+    mut base_q: Query<(&GridPos, &mut Base), (Without<Worker>, Without<ResourceNode>)>,
     mut workers: Query<
         (
             &mut GridPos,
@@ -821,7 +1058,7 @@ fn step_workers(
             &mut Inventory,
             &mut NavState,
         ),
-        (With<Worker>, Without<EnergyNode>, Without<Base>),
+        (With<Worker>, Without<ResourceNode>, Without<Base>),
     >,
 ) {
     // Tile actions taken so far this tick. The first worker to attempt a
@@ -831,13 +1068,15 @@ fn step_workers(
     // tile — Bevy's commands are queued, so energy_q is otherwise stale.
     let mut tile_locks: HashSet<(GridPos, TileAction)> = HashSet::new();
 
-    // Snapshot of every worker's outstanding energy reservation. Each worker
-    // planning a fresh navigate_to(energy) excludes tiles already in this
-    // set, then inserts its own choice — so later workers in the same tick
-    // see earlier workers' claims.
-    let mut energy_claims: HashSet<GridPos> = workers
+    // Snapshot of every worker's outstanding resource-tile reservation. Each
+    // worker planning a fresh navigate_to(resource) excludes tiles already
+    // in this set, then inserts its own choice — so later workers in the
+    // same tick see earlier workers' claims. Tile-only (not per-kind):
+    // workers fan out even across kinds at the cost of slight over-restriction
+    // on the rare grass+wood overlap.
+    let mut resource_claims: HashSet<GridPos> = workers
         .iter()
-        .filter_map(|(_, _, _, _, nav)| nav.energy_target)
+        .filter_map(|(_, _, _, _, nav)| nav.reserved_tile)
         .collect();
 
     for (mut pos, mut prog, mut facing, mut inv, mut nav) in &mut workers {
@@ -852,36 +1091,44 @@ fn step_workers(
                 // still turns toward the obstacle.
                 step_in_direction(&world, &mut pos, &mut facing, dir);
             }
-            Action::Pickup => {
+            Action::Pickup(filter) => {
                 // insert() returns true on first acquire, false if another
-                // worker already claimed this tile-action this tick.
+                // worker already claimed this tile-pickup this tick. Without
+                // this, two workers on the same tile would both despawn the
+                // same node (commands are queued, so resource_q is stale
+                // until next tick).
                 if tile_locks.insert((*pos, TileAction::Pickup)) {
-                    for (ent, epos) in &energy_q {
-                        if *epos == *pos {
-                            commands.entity(ent).despawn();
-                            inv.energy += 1;
-                            break;
+                    // Grab one resource of the requested kind (or any kind
+                    // if filter is None). If the queue is full, the evicted
+                    // oldest item is dropped back onto the worker's tile as
+                    // a fresh ResourceNode so it remains collectible.
+                    let hit = resource_q.iter().find(|(_, rpos, res)| {
+                        **rpos == *pos && filter.is_none_or(|want| res.kind == want)
+                    });
+                    if let Some((ent, _, res)) = hit {
+                        commands.entity(ent).despawn();
+                        if let Some(evicted) = inv.push(res.kind) {
+                            spawn_resource_node(&mut commands, &assets, evicted, *pos);
                         }
                     }
                 }
                 // Clear the reservation only if it was for this tile —
                 // we're done with it. We deliberately do NOT remove it
-                // from `energy_claims` this tick: despawns are queued,
-                // so `energy_q` still lists the just-consumed node, and
+                // from `resource_claims` this tick: despawns are queued,
+                // so resource_q still lists the just-consumed node, and
                 // dropping the claim now would let other workers later
                 // in this same tick re-target the stale tile. The claim
-                // falls out naturally next tick when `energy_claims` is
+                // falls out naturally next tick when `resource_claims` is
                 // rebuilt from (now-cleared) NavStates.
-                if nav.energy_target == Some(*pos) {
-                    nav.energy_target = None;
+                if nav.reserved_tile == Some(*pos) {
+                    nav.reserved_tile = None;
                 }
             }
             Action::Drop => {
-                if inv.energy > 0 {
+                if !inv.is_empty() {
                     for (bpos, mut base) in &mut base_q {
                         if *bpos == *pos {
-                            base.stored += inv.energy;
-                            inv.energy = 0;
+                            inv.drain_into(&mut base.stored);
                             break;
                         }
                     }
@@ -893,14 +1140,15 @@ fn step_workers(
                 if nav.plan.is_empty() {
                     // Drop our own claim before re-planning so we can validly
                     // re-target it (or move on to a different one).
-                    if let Some(prev) = nav.energy_target.take() {
-                        energy_claims.remove(&prev);
+                    if let Some(prev) = nav.reserved_tile.take() {
+                        resource_claims.remove(&prev);
                     }
                     let targets: Vec<GridPos> = match target {
-                        Target::Energy => energy_q
+                        Target::Resource(kind) => resource_q
                             .iter()
-                            .map(|(_, p)| *p)
-                            .filter(|p| !energy_claims.contains(p))
+                            .filter(|(_, _, r)| r.kind == kind)
+                            .map(|(_, p, _)| *p)
+                            .filter(|p| !resource_claims.contains(p))
                             .collect(),
                         Target::Base => base_q.iter().map(|(p, _)| *p).collect(),
                     };
@@ -909,15 +1157,16 @@ fn step_workers(
                     // "no path found", so no separate empty-guard is needed.
                     let plan = find_path(&world, *pos, |p| targets.contains(&p))
                         .unwrap_or_default();
-                    if let (Target::Energy, false) = (target, plan.is_empty()) {
-                        // Lock in the destination tile so other workers
-                        // don't race for it. We only claim when the plan is
-                        // non-empty — standing on an energy tile means the
-                        // next instruction (typically Pickup) will fire and
-                        // no lock is needed.
+                    if let (Target::Resource(_), false) = (target, plan.is_empty()) {
+                        // Lock in the destination tile so other workers don't
+                        // race for it. Reserve for any resource kind, not
+                        // just energy — the fan-out behavior is identical.
+                        // No claim when the plan is empty: standing on a
+                        // resource tile means the next instruction (typically
+                        // Pickup) fires and no lock is needed.
                         let dest = path_destination(*pos, &plan);
-                        nav.energy_target = Some(dest);
-                        energy_claims.insert(dest);
+                        nav.reserved_tile = Some(dest);
+                        resource_claims.insert(dest);
                     }
                     nav.plan = plan;
                 }
@@ -1012,11 +1261,42 @@ fn orbit_camera_input(
     }
 }
 
-// Visual flourish — slow Y rotation so energy nodes are visible at a glance.
-fn spin_energy(time: Res<Time>, mut q: Query<&mut Transform, With<EnergyNode>>) {
+// Mirror each worker's Inventory.queue onto its CarrySlot children: visible
+// + colored when occupied, hidden when empty. Runs every frame so a drop or
+// pickup is reflected on the next render with no extra wiring.
+fn update_carry_display(
+    workers: Query<(&Inventory, &Children), With<Worker>>,
+    mut slots: Query<(
+        &CarrySlot,
+        &mut Visibility,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
+    assets: Res<ResourceAssets>,
+) {
+    for (inv, children) in &workers {
+        for &child in children {
+            let Ok((slot, mut vis, mut mat)) = slots.get_mut(child) else {
+                continue;
+            };
+            match inv.queue.get(slot.0) {
+                Some(&kind) => {
+                    *vis = Visibility::Visible;
+                    mat.0 = assets.material_for(kind);
+                }
+                None => *vis = Visibility::Hidden,
+            }
+        }
+    }
+}
+
+// Visual flourish — slow Y rotation so energy gems catch the eye. Grass and
+// wood don't spin; they're meant to read as static groundcover.
+fn spin_energy(time: Res<Time>, mut q: Query<(&ResourceNode, &mut Transform)>) {
     let dt = time.delta_secs();
-    for mut tf in &mut q {
-        tf.rotate_y(dt * 1.5);
+    for (res, mut tf) in &mut q {
+        if matches!(res.kind, ResourceKind::Energy) {
+            tf.rotate_y(dt * 1.5);
+        }
     }
 }
 
@@ -1063,6 +1343,13 @@ fn interpolate_transforms(
     }
 }
 
+fn show_resource_counts(ui: &mut egui::Ui, header: &str, counts: &[u32; ResourceKind::COUNT]) {
+    ui.label(header);
+    for kind in ResourceKind::ALL {
+        ui.monospace(format!("  {}: {}", kind.label(), counts[kind as usize]));
+    }
+}
+
 fn editor_ui(
     mut contexts: EguiContexts,
     mut editor: ResMut<Editor>,
@@ -1076,8 +1363,9 @@ fn editor_ui(
         .show(ctx, |ui| {
             ui.heading("Worker Program");
             ui.label("One instruction per line. Tokens:");
-            ui.monospace("N S E W Wait Pickup Drop");
-            ui.monospace("navigate_to(closest, energy|base)");
+            ui.monospace("N S E W Wait Drop");
+            ui.monospace("pickup [energy|grass|wood]");
+            ui.monospace("navigate_to(closest, energy|grass|wood|base)");
             ui.label("'#' starts a comment.");
             ui.separator();
 
@@ -1123,10 +1411,17 @@ fn editor_ui(
                     prog.instructions.len()
                 ));
             }
-            let carried: u32 = q.iter().map(|(_, inv, _)| inv.energy).sum();
-            ui.label(format!("carried: {carried}"));
+            // Sum each kind across all worker inventories. Per-worker queue
+            // contents aren't shown — that'd need N panels for N workers.
+            let mut carried = [0u32; ResourceKind::COUNT];
+            for (_, inv, _) in &q {
+                for &k in &inv.queue {
+                    carried[k as usize] += 1;
+                }
+            }
+            show_resource_counts(ui, "carried (all workers):", &carried);
             if let Ok(base) = bases.single() {
-                ui.label(format!("delivered: {}", base.stored));
+                show_resource_counts(ui, "delivered:", &base.stored);
             }
             ui.separator();
             ui.label("Camera:");
@@ -1414,7 +1709,25 @@ mod tests {
         );
     }
 
-    // --- step_workers energy reservation ------------------------------------
+    // --- step_workers reservation + pickup ----------------------------------
+
+    // step_workers reads Res<ResourceAssets> for the eviction respawn path.
+    // Tests don't exercise that path (queue stays under capacity) but Bevy
+    // still requires the resource to exist, so insert dummy handles.
+    fn dummy_resource_assets() -> ResourceAssets {
+        ResourceAssets {
+            visuals: ResourceKind::ALL.map(|_| ResourceVisual {
+                mesh: Handle::default(),
+                material: Handle::default(),
+                y: 0.0,
+                rotation: Quat::IDENTITY,
+            }),
+        }
+    }
+
+    fn count_kind(inv: &Inventory, kind: ResourceKind) -> u32 {
+        inv.queue.iter().filter(|&&k| k == kind).count() as u32
+    }
 
     fn spawn_navigator(world: &mut bevy::ecs::world::World, pos: GridPos) -> Entity {
         world
@@ -1430,7 +1743,7 @@ mod tests {
                 Program {
                     instructions: vec![Action::NavigateTo(
                         NavQualifier::Closest,
-                        Target::Energy,
+                        Target::Resource(ResourceKind::Energy),
                     )],
                     pc: 0,
                 },
@@ -1444,12 +1757,13 @@ mod tests {
         world.insert_resource(World {
             tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
         });
+        world.insert_resource(dummy_resource_assets());
 
         // Two energy tiles five and six steps north of the workers — far
-        // enough that one-tick paths don't drain to empty, so energy_target
+        // enough that one-tick paths don't drain to empty, so reserved_tile
         // is still set when we inspect it.
-        world.spawn((EnergyNode, GridPos { x: 5, y: 10 }));
-        world.spawn((EnergyNode, GridPos { x: 5, y: 11 }));
+        world.spawn((ResourceNode { kind: ResourceKind::Energy }, GridPos { x: 5, y: 10 }));
+        world.spawn((ResourceNode { kind: ResourceKind::Energy }, GridPos { x: 5, y: 11 }));
 
         let w1 = spawn_navigator(&mut world, GridPos { x: 5, y: 5 });
         let w2 = spawn_navigator(&mut world, GridPos { x: 5, y: 5 });
@@ -1458,8 +1772,8 @@ mod tests {
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
 
-        let t1 = world.get::<NavState>(w1).unwrap().energy_target;
-        let t2 = world.get::<NavState>(w2).unwrap().energy_target;
+        let t1 = world.get::<NavState>(w1).unwrap().reserved_tile;
+        let t2 = world.get::<NavState>(w2).unwrap().reserved_tile;
         assert!(t1.is_some() && t2.is_some(), "both workers should hold a claim");
         assert_ne!(t1, t2, "workers must reserve different energy tiles");
         let mut targets = [t1.unwrap(), t2.unwrap()];
@@ -1475,17 +1789,18 @@ mod tests {
         // Two workers, two energy tiles. Worker A is already on its
         // reserved tile and Pickups this tick. Worker B is far away and
         // plans navigate_to(energy) this tick. Because A's despawn is
-        // deferred, energy_q still lists A's tile during B's planning —
+        // deferred, resource_q still lists A's tile during B's planning —
         // so the reservation set must keep A's tile claimed until next
         // tick, otherwise B would re-target the stale tile.
         let mut world = bevy::ecs::world::World::new();
         world.insert_resource(World {
             tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
         });
+        world.insert_resource(dummy_resource_assets());
         let a_tile = GridPos { x: 5, y: 5 };
         let other = GridPos { x: 10, y: 10 };
-        world.spawn((EnergyNode, a_tile));
-        world.spawn((EnergyNode, other));
+        world.spawn((ResourceNode { kind: ResourceKind::Energy }, a_tile));
+        world.spawn((ResourceNode { kind: ResourceKind::Energy }, other));
 
         // Worker A — about to pick up at its reserved tile.
         world.spawn((
@@ -1494,14 +1809,14 @@ mod tests {
             Inventory::default(),
             NavState {
                 plan: VecDeque::new(),
-                energy_target: Some(a_tile),
+                reserved_tile: Some(a_tile),
             },
             Facing {
                 prev_yaw: 0.0,
                 current_yaw: 0.0,
             },
             Program {
-                instructions: vec![Action::Pickup],
+                instructions: vec![Action::Pickup(None)],
                 pc: 0,
             },
         ));
@@ -1519,7 +1834,7 @@ mod tests {
                 Program {
                     instructions: vec![Action::NavigateTo(
                         NavQualifier::Closest,
-                        Target::Energy,
+                        Target::Resource(ResourceKind::Energy),
                     )],
                     pc: 0,
                 },
@@ -1530,7 +1845,7 @@ mod tests {
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
 
-        let target_b = world.get::<NavState>(b).unwrap().energy_target;
+        let target_b = world.get::<NavState>(b).unwrap().reserved_tile;
         assert_ne!(
             target_b,
             Some(a_tile),
@@ -1544,12 +1859,13 @@ mod tests {
     }
 
     #[test]
-    fn pickup_releases_energy_reservation() {
+    fn pickup_releases_reservation() {
         let mut world = bevy::ecs::world::World::new();
         world.insert_resource(World {
             tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
         });
-        world.spawn((EnergyNode, GridPos { x: 5, y: 5 }));
+        world.insert_resource(dummy_resource_assets());
+        world.spawn((ResourceNode { kind: ResourceKind::Energy }, GridPos { x: 5, y: 5 }));
 
         // Worker is standing on an energy tile with a stale reservation,
         // running Pickup. After the tick, the reservation must be cleared
@@ -1561,14 +1877,14 @@ mod tests {
                 Inventory::default(),
                 NavState {
                     plan: VecDeque::new(),
-                    energy_target: Some(GridPos { x: 5, y: 5 }),
+                    reserved_tile: Some(GridPos { x: 5, y: 5 }),
                 },
                 Facing {
                     prev_yaw: 0.0,
                     current_yaw: 0.0,
                 },
                 Program {
-                    instructions: vec![Action::Pickup],
+                    instructions: vec![Action::Pickup(None)],
                     pc: 0,
                 },
             ))
@@ -1579,11 +1895,14 @@ mod tests {
         schedule.run(&mut world);
 
         assert_eq!(
-            world.get::<NavState>(w).unwrap().energy_target,
+            world.get::<NavState>(w).unwrap().reserved_tile,
             None,
-            "Pickup must release the energy reservation"
+            "Pickup must release the reservation"
         );
-        assert_eq!(world.get::<Inventory>(w).unwrap().energy, 1);
+        assert_eq!(
+            count_kind(world.get::<Inventory>(w).unwrap(), ResourceKind::Energy),
+            1,
+        );
     }
 
     // --- step_workers pickup contention -------------------------------------
@@ -1594,13 +1913,14 @@ mod tests {
         world.insert_resource(World {
             tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
         });
+        world.insert_resource(dummy_resource_assets());
 
         let energy_ent = world
-            .spawn((EnergyNode, GridPos { x: 5, y: 5 }))
+            .spawn((ResourceNode { kind: ResourceKind::Energy }, GridPos { x: 5, y: 5 }))
             .id();
 
         let pickup_prog = || Program {
-            instructions: vec![Action::Pickup],
+            instructions: vec![Action::Pickup(None)],
             pc: 0,
         };
         let make_worker = |w: &mut bevy::ecs::world::World| {
@@ -1630,8 +1950,8 @@ mod tests {
             "energy entity should be despawned"
         );
         // Exactly one worker should have picked it up — phantom energy is a bug.
-        let e1 = world.get::<Inventory>(w1).unwrap().energy;
-        let e2 = world.get::<Inventory>(w2).unwrap().energy;
+        let e1 = count_kind(world.get::<Inventory>(w1).unwrap(), ResourceKind::Energy);
+        let e2 = count_kind(world.get::<Inventory>(w2).unwrap(), ResourceKind::Energy);
         assert_eq!(
             e1 + e2,
             1,
@@ -1702,6 +2022,125 @@ mod tests {
             seen[World::idx(far.0, far.1)],
             "far corner should be reachable after ensure_connected"
         );
+    }
+
+    // --- parser --------------------------------------------------------------
+
+    #[test]
+    fn parse_program_recognizes_navigate_to_each_resource_kind() {
+        let src = "\
+navigate_to(closest, energy)
+navigate_to(closest, grass)
+navigate_to(closest, wood)
+navigate_to(closest, base)
+";
+        let actions = parse_program(src).unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::NavigateTo(NavQualifier::Closest, Target::Resource(ResourceKind::Energy)),
+                Action::NavigateTo(NavQualifier::Closest, Target::Resource(ResourceKind::Grass)),
+                Action::NavigateTo(NavQualifier::Closest, Target::Resource(ResourceKind::Wood)),
+                Action::NavigateTo(NavQualifier::Closest, Target::Base),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_pickup_without_kind_is_any() {
+        let actions = parse_program("pickup\n").unwrap();
+        assert_eq!(actions, vec![Action::Pickup(None)]);
+    }
+
+    #[test]
+    fn parse_program_pickup_with_kind_filters() {
+        let actions = parse_program(
+            "pickup(energy)\npickup(grass)\npickup(wood)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::Pickup(Some(ResourceKind::Energy)),
+                Action::Pickup(Some(ResourceKind::Grass)),
+                Action::Pickup(Some(ResourceKind::Wood)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_rejects_unknown_pickup_kind() {
+        let err = parse_program("pickup(stone)").unwrap_err();
+        assert!(err.contains("stone"), "error should mention the bad token: {err}");
+    }
+
+    #[test]
+    fn parse_program_rejects_unknown_resource_target() {
+        let err = parse_program("navigate_to(closest, stone)").unwrap_err();
+        assert!(
+            err.contains("stone"),
+            "error should mention the unknown token: {err}"
+        );
+    }
+
+    // --- inventory queue ----------------------------------------------------
+
+    #[test]
+    fn inventory_starts_empty() {
+        let inv = Inventory::default();
+        assert!(inv.is_empty());
+    }
+
+    #[test]
+    fn inventory_push_holds_up_to_capacity() {
+        let mut inv = Inventory::default();
+        inv.push(ResourceKind::Energy);
+        inv.push(ResourceKind::Grass);
+        assert_eq!(
+            inv.queue.iter().copied().collect::<Vec<_>>(),
+            vec![ResourceKind::Energy, ResourceKind::Grass]
+        );
+    }
+
+    #[test]
+    fn inventory_push_evicts_oldest_when_full() {
+        let mut inv = Inventory::default();
+        inv.push(ResourceKind::Energy);
+        inv.push(ResourceKind::Grass);
+        inv.push(ResourceKind::Wood);
+        // Energy (oldest) was evicted; queue now [Grass, Wood].
+        assert_eq!(
+            inv.queue.iter().copied().collect::<Vec<_>>(),
+            vec![ResourceKind::Grass, ResourceKind::Wood]
+        );
+    }
+
+    #[test]
+    fn inventory_push_returns_none_within_capacity() {
+        let mut inv = Inventory::default();
+        assert_eq!(inv.push(ResourceKind::Energy), None);
+        assert_eq!(inv.push(ResourceKind::Grass), None);
+    }
+
+    #[test]
+    fn inventory_push_returns_evicted_kind_when_full() {
+        let mut inv = Inventory::default();
+        inv.push(ResourceKind::Energy);
+        inv.push(ResourceKind::Grass);
+        assert_eq!(inv.push(ResourceKind::Wood), Some(ResourceKind::Energy));
+    }
+
+    #[test]
+    fn inventory_drain_into_clears_queue_and_increments_counts() {
+        let mut inv = Inventory::default();
+        inv.push(ResourceKind::Energy);
+        inv.push(ResourceKind::Grass);
+        let mut counts = [0u32; ResourceKind::COUNT];
+        inv.drain_into(&mut counts);
+        assert!(inv.is_empty());
+        assert_eq!(counts[ResourceKind::Energy as usize], 1);
+        assert_eq!(counts[ResourceKind::Grass as usize], 1);
+        assert_eq!(counts[ResourceKind::Wood as usize], 0);
     }
 
     #[test]

@@ -40,12 +40,13 @@ This step has **three parts**. Always attempt all three:
 - For visual or interactive behavior (e.g. Bevy rendering, audio output, UI animations): an automated test usually does not exist that meaningfully verifies the change. Say so explicitly: *"No automated test fits — visual behavior."* Then move on.
 - For mixed cases (game logic that's visible but also has pure data shape): write the test for the pure-data part and verify the visual part by running.
 
-**b. Lint check (always).**
-- `cargo clippy --all-targets -- -D warnings` must pass with zero warnings. CI enforces this on every PR, so catching lints locally avoids a round-trip.
+**b. Lint check (mandatory — do not skip).**
+- `cargo clippy --all-targets -- -D warnings` must pass with zero warnings before the cycle can move to step 3. CI enforces this on every PR.
+- **The cycle is not complete until clippy passes.** If clippy was never run, or passed only after you decided to "ship and clean up later," the cycle failed. A separate follow-up commit titled "fix clippy warnings" is the canonical signal that this step was skipped — don't create that commit, fix the warnings in the same cycle.
 - Most lints are auto-fixable: `cargo clippy --fix --allow-dirty --all-targets`. Inspect the diff before keeping the fix.
 - If clippy flags something you genuinely want to keep (e.g. a Bevy query type), prefer a targeted `#[allow(...)]` over a crate-wide allow, and write a one-line comment naming the reason.
 
-**c. Runtime verification (always).**
+**c. Runtime verification (mandatory).**
 - `cargo build` to confirm the code compiles.
 - `cargo run` (or equivalent) and exercise the path. State what you observed.
 - If the change is visual and you can't observe it yourself (e.g. running inside a sandboxed agent), say so explicitly rather than claiming success.
@@ -81,7 +82,12 @@ After refactoring, **re-run step 2 verification** to make sure nothing broke. Th
 
 When the cycle is complete, summarize:
 - What was implemented (one sentence)
-- How it was verified (test names + what was run + observed behavior)
+- How it was verified — must include three lines:
+  - **Tests:** test names run, pass/fail counts
+  - **Clippy:** result of `cargo clippy --all-targets -- -D warnings` (e.g. "clean" or "N warnings fixed: <short list>")
+  - **Runtime:** what was run and what was observed (or "can't observe — sandboxed")
 - What was refactored (list of changes applied) and what was skipped (list with reasons)
 
-This makes the cycle auditable — a future reviewer can see whether the refactor step was genuinely done or just rubber-stamped.
+If the Clippy line says anything other than "clean," it should describe what was fixed *in this cycle*. The absence of a Clippy line — or a vague one like "passes" without a command run — means the cycle is incomplete; go back and run it.
+
+This makes the cycle auditable — a future reviewer can see whether the refactor step was genuinely done or just rubber-stamped, and whether lint cleanup was bundled in or pushed to a follow-up commit.
