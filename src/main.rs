@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 const GRID_W: i32 = 20;
 const GRID_H: i32 = 15;
 const START: GridPos = GridPos { x: 5, y: 5 };
-const NUM_WORKERS: usize = 4;
+const NUM_WORKERS: usize = 10;
 // A worker whose movement intent is blocked this many ticks in a row gives
 // up — its carried energy spills onto its last tile and the entity
 // despawns. Only blocked Move / NavigateTo steps increment the counter;
@@ -717,6 +717,26 @@ fn setup(
                     resource_positions.insert(pos);
                     spawn_resource_node(&mut commands, &resource_assets, kind, pos);
                 }
+            }
+        }
+    }
+
+    // Stress-test cluster: pile energy onto every passable cell in the
+    // lower-right of the map. ensure_connected guarantees the region is
+    // reachable from START via a (typically narrow) carved corridor, so
+    // workers all converge there and trigger the bump/re-plan/despawn
+    // paths in normal play.
+    for gy in 10..GRID_H {
+        for gx in (GRID_W - 6)..GRID_W {
+            let pos = GridPos { x: gx, y: gy };
+            if pos == START {
+                continue;
+            }
+            if !matches!(world.get(gx, gy), Some(t) if t.passable()) {
+                continue;
+            }
+            if energy_positions.insert(pos) {
+                commands.spawn((EnergyNode, pos));
             }
         }
     }
