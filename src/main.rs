@@ -1166,7 +1166,7 @@ fn step_workers(
         let mut blocked = false;
         match action {
             Action::Move(dir) => {
-                if step_in_direction(&world, &mut *pos, &mut *facing, dir, &mut occupied) {
+                if step_in_direction(&world, &mut pos, &mut facing, dir, &mut occupied) {
                     moved = true;
                 } else {
                     blocked = true;
