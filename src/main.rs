@@ -7,9 +7,12 @@ const GRID_W: i32 = 20;
 const GRID_H: i32 = 15;
 const START: GridPos = GridPos { x: 5, y: 5 };
 const NUM_WORKERS: usize = 4;
-// A worker that fails to move this many ticks in a row gives up — its
-// carried energy spills onto its last tile and the entity despawns. The
-// counter resets on any successful step, so productive workers never die.
+// A worker whose movement intent is blocked this many ticks in a row gives
+// up — its carried energy spills onto its last tile and the entity
+// despawns. Only blocked Move / NavigateTo steps increment the counter;
+// Wait, Pickup, Drop, and ticks where NavigateTo finds no plan leave it
+// alone. The counter resets on any successful step, so productive workers
+// never die.
 const MAX_BUMPS: u32 = 10;
 const CARDINAL_DIRS: [Direction; 4] = [
     Direction::North,
@@ -416,9 +419,11 @@ impl Inventory {
     }
 }
 
-// Tally of consecutive failed-to-move ticks. Reset to 0 on any successful
-// step. When this reaches `MAX_BUMPS` the worker despawns and spills its
-// inventory at its current tile.
+// Tally of consecutive ticks where a movement intent (Move or NavigateTo
+// step) was blocked. Non-moving instructions (Wait/Pickup/Drop) and ticks
+// where NavigateTo has no plan don't change the counter. Reset to 0 on any
+// successful step. When this reaches `MAX_BUMPS` the worker despawns and
+// spills its inventory at its current tile.
 #[derive(Component, Default, Debug, Clone, Copy)]
 struct BumpCount(u32);
 
