@@ -7,6 +7,10 @@ const GRID_W: i32 = 20;
 const GRID_H: i32 = 15;
 const START: GridPos = GridPos { x: 5, y: 5 };
 const NUM_WORKERS: usize = 4;
+// A worker that fails to move this many ticks in a row gives up — its
+// carried energy spills onto its last tile and the entity despawns. The
+// counter resets on any successful step, so productive workers never die.
+const MAX_BUMPS: u32 = 10;
 const CARDINAL_DIRS: [Direction; 4] = [
     Direction::North,
     Direction::South,
@@ -412,6 +416,12 @@ impl Inventory {
     }
 }
 
+// Tally of consecutive failed-to-move ticks. Reset to 0 on any successful
+// step. When this reaches `MAX_BUMPS` the worker despawns and spills its
+// inventory at its current tile.
+#[derive(Component, Default, Debug, Clone, Copy)]
+struct BumpCount(u32);
+
 #[derive(Component, Default)]
 struct Base {
     stored: [u32; ResourceKind::COUNT],
@@ -793,6 +803,7 @@ fn spawn_worker(
             grid_pos,
             Inventory::default(),
             NavState::default(),
+            BumpCount::default(),
             Program {
                 instructions: program,
                 pc: 0,
@@ -864,22 +875,45 @@ fn try_walk(world: &World, pos: GridPos, dir: Direction) -> Option<GridPos> {
 
 // Face the given direction and try to walk one cell. Centralizes the canonical
 // "one tick of motion" used by both Action::Move and the per-tick step of
-// Action::NavigateTo, so future motion verbs can't drift apart.
-fn step_in_direction(world: &World, pos: &mut GridPos, facing: &mut Facing, dir: Direction) {
+// Action::NavigateTo, so future motion verbs can't drift apart. Returns
+// `true` if the worker moved, `false` if blocked (by terrain or by another
+// worker in `occupied`). Callers driving a cached path use the return value
+// to decide whether to consume the planned step.
+//
+// `occupied` is the set of tiles currently held by *other* workers (plus the
+// caller's own tile). If the destination is in the set the worker stays put
+// — facing still updates so they visibly turn toward the blocker.
+fn step_in_direction(
+    world: &World,
+    pos: &mut GridPos,
+    facing: &mut Facing,
+    dir: Direction,
+    occupied: &mut HashSet<GridPos>,
+) -> bool {
     facing.current_yaw = dir.yaw();
-    if let Some(new_pos) = try_walk(world, *pos, dir) {
-        *pos = new_pos;
+    let Some(new_pos) = try_walk(world, *pos, dir) else {
+        return false;
+    };
+    if occupied.contains(&new_pos) {
+        return false;
     }
+    occupied.remove(pos);
+    occupied.insert(new_pos);
+    *pos = new_pos;
+    true
 }
 
-// BFS from `start` over passable terrain. Returns the path to the first cell
-// satisfying `is_target` — which is also the closest such cell, since BFS on
-// unit-cost grids expands in order of distance. Returns None if no reachable
-// target exists; returns Some(empty) if the start cell itself is a target.
+// BFS from `start` over passable terrain, treating cells in `blocked` as
+// impassable. Returns the path to the first cell satisfying `is_target` —
+// also the closest such cell since BFS on unit-cost grids expands in order
+// of distance. Returns None if no reachable target exists; returns
+// Some(empty) if the start cell itself is a target. Pass `&HashSet::new()`
+// when there are no dynamic obstacles to consider.
 fn find_path(
     world: &World,
     start: GridPos,
     is_target: impl Fn(GridPos) -> bool,
+    blocked: &HashSet<GridPos>,
 ) -> Option<VecDeque<Direction>> {
     if is_target(start) {
         return Some(VecDeque::new());
@@ -902,6 +936,10 @@ fn find_path(
             }
             let Some(t) = world.get(nx, ny) else { continue };
             if !t.passable() {
+                continue;
+            }
+            let cell = GridPos { x: nx, y: ny };
+            if blocked.contains(&cell) {
                 continue;
             }
             came_from.insert((nx, ny), Some(((cx, cy), dir)));
@@ -1052,11 +1090,13 @@ fn step_workers(
     mut base_q: Query<(&GridPos, &mut Base), (Without<Worker>, Without<ResourceNode>)>,
     mut workers: Query<
         (
+            Entity,
             &mut GridPos,
             &mut Program,
             &mut Facing,
             &mut Inventory,
             &mut NavState,
+            Option<&mut BumpCount>,
         ),
         (With<Worker>, Without<ResourceNode>, Without<Base>),
     >,
@@ -1076,20 +1116,36 @@ fn step_workers(
     // on the rare grass+wood overlap.
     let mut resource_claims: HashSet<GridPos> = workers
         .iter()
-        .filter_map(|(_, _, _, _, nav)| nav.reserved_tile)
+        .filter_map(|(_, _, _, _, _, nav, _)| nav.reserved_tile)
         .collect();
 
-    for (mut pos, mut prog, mut facing, mut inv, mut nav) in &mut workers {
+    // Snapshot of currently occupied worker tiles. Each successful move
+    // updates the set so later workers in this tick see fresh occupancy.
+    // Stepping into an occupied tile is a no-op ("bump"); the worker still
+    // turns to face the obstacle but doesn't move.
+    let mut occupied: HashSet<GridPos> = workers
+        .iter()
+        .map(|(_, pos, _, _, _, _, _)| *pos)
+        .collect();
+
+    for (entity, mut pos, mut prog, mut facing, mut inv, mut nav, mut bumps) in &mut workers {
         if prog.instructions.is_empty() {
             continue;
         }
         let action = prog.instructions[prog.pc];
         let mut advance_pc = true;
+        // Per-tick movement bookkeeping. `moved` resets the bump counter
+        // (the worker isn't stuck); `blocked` increments it (intent
+        // foiled). Wait/Pickup/Drop set neither and leave the counter alone.
+        let mut moved = false;
+        let mut blocked = false;
         match action {
             Action::Move(dir) => {
-                // Turn-and-walk; if the destination is blocked the worker
-                // still turns toward the obstacle.
-                step_in_direction(&world, &mut pos, &mut facing, dir);
+                if step_in_direction(&world, &mut *pos, &mut *facing, dir, &mut occupied) {
+                    moved = true;
+                } else {
+                    blocked = true;
+                }
             }
             Action::Pickup(filter) => {
                 // insert() returns true on first acquire, false if another
@@ -1136,49 +1192,133 @@ fn step_workers(
             }
             Action::Wait => {}
             Action::NavigateTo(_qualifier, target) => {
-                // Lazy plan: only recompute when we have no cached steps.
-                if nav.plan.is_empty() {
-                    // Drop our own claim before re-planning so we can validly
-                    // re-target it (or move on to a different one).
-                    if let Some(prev) = nav.reserved_tile.take() {
-                        resource_claims.remove(&prev);
-                    }
+                // Closure shared by initial plan and bump re-plan. `claims`
+                // and `blocked` are passed by ref each call so the closure
+                // doesn't capture `resource_claims` (which we mutate around
+                // these calls).
+                let make_plan = |start: GridPos,
+                                 claims: &HashSet<GridPos>,
+                                 blocked: &HashSet<GridPos>| {
                     let targets: Vec<GridPos> = match target {
                         Target::Resource(kind) => resource_q
                             .iter()
                             .filter(|(_, _, r)| r.kind == kind)
                             .map(|(_, p, _)| *p)
-                            .filter(|p| !resource_claims.contains(p))
+                            .filter(|p| !claims.contains(p))
                             .collect(),
                         Target::Base => base_q.iter().map(|(p, _)| *p).collect(),
                     };
-                    // find_path with an empty target set returns None, which
-                    // unwrap_or_default collapses to an empty plan — same as
-                    // "no path found", so no separate empty-guard is needed.
-                    let plan = find_path(&world, *pos, |p| targets.contains(&p))
-                        .unwrap_or_default();
+                    find_path(&world, start, |p| targets.contains(&p), blocked)
+                        .unwrap_or_default()
+                };
+
+                // Lazy plan: only recompute when we have no cached steps.
+                // The initial plan ignores other workers — they're transient
+                // obstacles, no point routing around them eagerly.
+                if nav.plan.is_empty() {
+                    if let Some(prev) = nav.reserved_tile.take() {
+                        resource_claims.remove(&prev);
+                    }
+                    let plan = make_plan(*pos, &resource_claims, &HashSet::new());
                     if let (Target::Resource(_), false) = (target, plan.is_empty()) {
-                        // Lock in the destination tile so other workers don't
-                        // race for it. Reserve for any resource kind, not
-                        // just energy — the fan-out behavior is identical.
-                        // No claim when the plan is empty: standing on a
-                        // resource tile means the next instruction (typically
-                        // Pickup) fires and no lock is needed.
                         let dest = path_destination(*pos, &plan);
                         nav.reserved_tile = Some(dest);
                         resource_claims.insert(dest);
                     }
                     nav.plan = plan;
                 }
-                if let Some(dir) = nav.plan.pop_front() {
-                    step_in_direction(&world, &mut pos, &mut facing, dir);
+                // Attempt one step. On success, drain the planned direction.
+                // On a bump, throw the cached plan out and re-plan against
+                // the actual occupancy — and if even that fails, sidestep.
+                if let Some(&dir) = nav.plan.front() {
+                    if step_in_direction(
+                        &world,
+                        &mut *pos,
+                        &mut *facing,
+                        dir,
+                        &mut occupied,
+                    ) {
+                        nav.plan.pop_front();
+                        moved = true;
+                    } else {
+                        blocked = true;
+                        nav.plan.clear();
+                        if let Some(prev) = nav.reserved_tile.take() {
+                            resource_claims.remove(&prev);
+                        }
+                        // Re-plan with every other worker treated as a wall.
+                        // We exclude ourselves so we can leave our own tile.
+                        let mut obstacles = occupied.clone();
+                        obstacles.remove(&*pos);
+                        let alt = make_plan(*pos, &resource_claims, &obstacles);
+                        if !alt.is_empty() {
+                            if matches!(target, Target::Resource(_)) {
+                                let dest = path_destination(*pos, &alt);
+                                nav.reserved_tile = Some(dest);
+                                resource_claims.insert(dest);
+                            }
+                            nav.plan = alt;
+                            // We don't take the first step inline — wait a
+                            // tick. Next tick the plan executes from the
+                            // current position.
+                        } else {
+                            // No detour exists (corridor, dead end, etc.).
+                            // Sidestep into any open neighbor other than the
+                            // bumped direction so the standoff breaks. Order
+                            // is the CARDINAL_DIRS rotation; deterministic
+                            // but varies by which direction got bumped.
+                            for sidestep in CARDINAL_DIRS {
+                                if sidestep == dir {
+                                    continue;
+                                }
+                                if step_in_direction(
+                                    &world,
+                                    &mut *pos,
+                                    &mut *facing,
+                                    sidestep,
+                                    &mut occupied,
+                                ) {
+                                    moved = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
-                // Hold pc on this instruction until the plan is fully drained.
-                advance_pc = nav.plan.is_empty();
+
+                // Advance pc when there's genuinely nothing left to do — the
+                // plan drained via successful steps, or no path could ever be
+                // found. A bump leaves us still trying to navigate.
+                advance_pc = !blocked && nav.plan.is_empty();
             }
         }
         if advance_pc {
             prog.pc = (prog.pc + 1) % prog.instructions.len();
+        }
+
+        // Update the bump counter. Any movement (planned or sidestep) resets
+        // it — productive workers never die. A blocked intent without
+        // movement increments it; at MAX_BUMPS the worker spills its
+        // inventory and despawns.
+        if let Some(bumps) = bumps.as_mut() {
+            if moved {
+                bumps.0 = 0;
+            } else if blocked {
+                bumps.0 += 1;
+                if bumps.0 >= MAX_BUMPS {
+                    // Release any outstanding resource reservation so later
+                    // workers in this same tick can target the tile.
+                    if let Some(prev) = nav.reserved_tile.take() {
+                        resource_claims.remove(&prev);
+                    }
+                    // Spill every carried resource back onto the worker's
+                    // tile as a fresh ResourceNode so others can collect.
+                    while let Some(kind) = inv.queue.pop_front() {
+                        spawn_resource_node(&mut commands, &assets, kind, *pos);
+                    }
+                    commands.entity(entity).despawn();
+                }
+            }
         }
     }
 }
@@ -1472,14 +1612,25 @@ mod tests {
     #[test]
     fn find_path_returns_empty_when_start_is_goal() {
         let w = flat_grass_world();
-        let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == GridPos { x: 5, y: 5 });
+        let p = find_path(
+            &w,
+            GridPos { x: 5, y: 5 },
+            |p| p == GridPos { x: 5, y: 5 },
+            &HashSet::new(),
+        );
         assert_eq!(p, Some(VecDeque::new()));
     }
 
     #[test]
     fn find_path_walks_a_straight_line_on_open_grass() {
         let w = flat_grass_world();
-        let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == GridPos { x: 8, y: 5 }).unwrap();
+        let p = find_path(
+            &w,
+            GridPos { x: 5, y: 5 },
+            |p| p == GridPos { x: 8, y: 5 },
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(p, VecDeque::from(vec![Direction::East; 3]));
     }
 
@@ -1488,7 +1639,13 @@ mod tests {
         let mut w = flat_grass_world();
         // Single-cell wall directly east of (5,5); detour must go north or south.
         place(&mut w, 6, 5, Terrain::Wall);
-        let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == GridPos { x: 7, y: 5 }).unwrap();
+        let p = find_path(
+            &w,
+            GridPos { x: 5, y: 5 },
+            |p| p == GridPos { x: 7, y: 5 },
+            &HashSet::new(),
+        )
+        .unwrap();
         // Manhattan distance is 2; the detour adds 2 extra steps.
         assert_eq!(p.len(), 4);
     }
@@ -1499,14 +1656,19 @@ mod tests {
         for (dx, dy) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
             place(&mut w, 7 + dx, 5 + dy, Terrain::Wall);
         }
-        let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == GridPos { x: 7, y: 5 });
+        let p = find_path(
+            &w,
+            GridPos { x: 5, y: 5 },
+            |p| p == GridPos { x: 7, y: 5 },
+            &HashSet::new(),
+        );
         assert_eq!(p, None);
     }
 
     #[test]
     fn find_path_returns_none_when_no_cell_matches() {
         let w = flat_grass_world();
-        let p = find_path(&w, GridPos { x: 5, y: 5 }, |_| false);
+        let p = find_path(&w, GridPos { x: 5, y: 5 }, |_| false, &HashSet::new());
         assert_eq!(p, None);
     }
 
@@ -1515,7 +1677,13 @@ mod tests {
         let w = flat_grass_world();
         let near = GridPos { x: 5, y: 6 };
         let far = GridPos { x: 5, y: 12 };
-        let p = find_path(&w, GridPos { x: 5, y: 5 }, |p| p == near || p == far).unwrap();
+        let p = find_path(
+            &w,
+            GridPos { x: 5, y: 5 },
+            |p| p == near || p == far,
+            &HashSet::new(),
+        )
+        .unwrap();
         // BFS expands by distance, so the 1-step target wins over the 7-step one.
         // (+1 in grid Y is South after the N/S swap.)
         assert_eq!(p, VecDeque::from(vec![Direction::South]));
@@ -1729,6 +1897,25 @@ mod tests {
         inv.queue.iter().filter(|&&k| k == kind).count() as u32
     }
 
+    // Spawn a stationary worker that runs Wait forever — useful as an
+    // obstacle in occupancy tests.
+    fn spawn_blocker(world: &mut bevy::ecs::world::World, pos: GridPos) {
+        world.spawn((
+            Worker,
+            pos,
+            Inventory::default(),
+            NavState::default(),
+            Facing {
+                prev_yaw: 0.0,
+                current_yaw: 0.0,
+            },
+            Program {
+                instructions: vec![Action::Wait],
+                pc: 0,
+            },
+        ));
+    }
+
     fn spawn_navigator(world: &mut bevy::ecs::world::World, pos: GridPos) -> Entity {
         world
             .spawn((
@@ -1903,6 +2090,356 @@ mod tests {
             count_kind(world.get::<Inventory>(w).unwrap(), ResourceKind::Energy),
             1,
         );
+    }
+
+    // --- step_in_direction occupancy ----------------------------------------
+
+    #[test]
+    fn step_in_direction_blocked_by_occupied_destination() {
+        let w = flat_grass_world();
+        let mut pos = GridPos { x: 5, y: 5 };
+        let mut facing = Facing {
+            prev_yaw: 0.0,
+            current_yaw: 0.0,
+        };
+        let mut occupied: HashSet<GridPos> =
+            [pos, GridPos { x: 5, y: 4 }].into_iter().collect();
+
+        let moved =
+            step_in_direction(&w, &mut pos, &mut facing, Direction::North, &mut occupied);
+
+        // Position unchanged, but facing still updates so the worker visibly
+        // turns toward the blocker (mirrors the wall-block behavior).
+        assert!(!moved, "blocked step should report no movement");
+        assert_eq!(pos, GridPos { x: 5, y: 5 });
+        assert_eq!(facing.current_yaw, Direction::North.yaw());
+        assert!(occupied.contains(&GridPos { x: 5, y: 5 }));
+        assert!(occupied.contains(&GridPos { x: 5, y: 4 }));
+    }
+
+    #[test]
+    fn step_in_direction_moves_into_free_tile_and_updates_set() {
+        let w = flat_grass_world();
+        let mut pos = GridPos { x: 5, y: 5 };
+        let mut facing = Facing {
+            prev_yaw: 0.0,
+            current_yaw: 0.0,
+        };
+        let mut occupied: HashSet<GridPos> = [pos].into_iter().collect();
+
+        let moved =
+            step_in_direction(&w, &mut pos, &mut facing, Direction::North, &mut occupied);
+
+        assert!(moved, "successful step should report movement");
+        assert_eq!(pos, GridPos { x: 5, y: 4 });
+        assert!(!occupied.contains(&GridPos { x: 5, y: 5 }), "old tile freed");
+        assert!(occupied.contains(&GridPos { x: 5, y: 4 }), "new tile claimed");
+    }
+
+    #[test]
+    fn bump_during_navigate_to_replans_around_blocker() {
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        });
+        world.insert_resource(dummy_resource_assets());
+        // Energy at (5,3): direct path from A is straight north, but B
+        // parks at (5,4) blocking that path. After one tick A should still
+        // be at (5,5) (we don't take an inline step), still on navigate_to,
+        // and the cached plan should now detour around B (no longer start
+        // with North).
+        world.spawn((
+            ResourceNode {
+                kind: ResourceKind::Energy,
+            },
+            GridPos { x: 5, y: 3 },
+        ));
+        let a = world
+            .spawn((
+                Worker,
+                GridPos { x: 5, y: 5 },
+                Inventory::default(),
+                NavState {
+                    plan: VecDeque::from(vec![Direction::North, Direction::North]),
+                    reserved_tile: None,
+                },
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::NavigateTo(
+                        NavQualifier::Closest,
+                        Target::Resource(ResourceKind::Energy),
+                    )],
+                    pc: 0,
+                },
+            ))
+            .id();
+        spawn_blocker(&mut world, GridPos { x: 5, y: 4 });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert_eq!(*world.get::<GridPos>(a).unwrap(), GridPos { x: 5, y: 5 });
+        let plan = &world.get::<NavState>(a).unwrap().plan;
+        assert!(
+            !plan.is_empty(),
+            "expected a fresh detour plan, got empty; should re-plan around B"
+        );
+        assert_ne!(
+            plan[0],
+            Direction::North,
+            "re-plan must route around the blocker, not back through them; plan={plan:?}"
+        );
+        assert_eq!(
+            world.get::<Program>(a).unwrap().pc,
+            0,
+            "pc should not advance off navigate_to while we haven't arrived"
+        );
+    }
+
+    #[test]
+    fn bump_with_no_alt_path_sidesteps_into_open_neighbor() {
+        // Tight corridor: only path from (5,5) to energy at (5,3) is
+        // through (5,4) — boxed in by walls on the other sides of both
+        // start and target. (4,5) is left as grass to provide a single
+        // valid sidestep.
+        let mut tiles = vec![Terrain::Grass; (GRID_W * GRID_H) as usize];
+        for (wx, wy) in [
+            (4, 4),
+            (6, 4),
+            (4, 3),
+            (6, 3),
+            (5, 2),
+            (6, 5),
+            (5, 6),
+        ] {
+            tiles[World::idx(wx, wy)] = Terrain::Wall;
+        }
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World { tiles });
+        world.insert_resource(dummy_resource_assets());
+        world.spawn((
+            ResourceNode {
+                kind: ResourceKind::Energy,
+            },
+            GridPos { x: 5, y: 3 },
+        ));
+
+        let a = world
+            .spawn((
+                Worker,
+                GridPos { x: 5, y: 5 },
+                Inventory::default(),
+                NavState::default(),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::NavigateTo(
+                        NavQualifier::Closest,
+                        Target::Resource(ResourceKind::Energy),
+                    )],
+                    pc: 0,
+                },
+            ))
+            .id();
+        spawn_blocker(&mut world, GridPos { x: 5, y: 4 });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        // Initial plan goes N, A bumps B, re-plan with B as obstacle finds
+        // no alternative (all other neighbors of (5,5) are walls). Sidestep
+        // iterates CARDINAL_DIRS skipping N; S/E are walls, W=(4,5) is
+        // grass and free.
+        assert_eq!(
+            *world.get::<GridPos>(a).unwrap(),
+            GridPos { x: 4, y: 5 },
+            "A should sidestep west — the only open non-bumped neighbor"
+        );
+        assert_eq!(
+            world.get::<Program>(a).unwrap().pc,
+            0,
+            "still on navigate_to; re-plan happens next tick from new pos"
+        );
+    }
+
+    #[test]
+    fn workers_cannot_step_onto_another_worker() {
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        });
+        world.insert_resource(dummy_resource_assets());
+        // A is at (5,5) and wants to walk North. B is parked at (5,4) running
+        // Wait — so A's destination is permanently occupied this tick.
+        let a = world
+            .spawn((
+                Worker,
+                GridPos { x: 5, y: 5 },
+                Inventory::default(),
+                NavState::default(),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::Move(Direction::North)],
+                    pc: 0,
+                },
+            ))
+            .id();
+        spawn_blocker(&mut world, GridPos { x: 5, y: 4 });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert_eq!(
+            *world.get::<GridPos>(a).unwrap(),
+            GridPos { x: 5, y: 5 },
+            "A should bump off B and stay put"
+        );
+    }
+
+    // --- bump count + despawn ----------------------------------------------
+
+    #[test]
+    fn bump_count_increments_when_move_is_blocked() {
+        let mut w = flat_grass_world();
+        place(&mut w, 5, 4, Terrain::Wall);
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(w);
+        world.insert_resource(dummy_resource_assets());
+
+        let a = world
+            .spawn((
+                Worker,
+                GridPos { x: 5, y: 5 },
+                Inventory::default(),
+                NavState::default(),
+                BumpCount::default(),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::Move(Direction::North)],
+                    pc: 0,
+                },
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert_eq!(world.get::<BumpCount>(a).unwrap().0, 1);
+        assert_eq!(*world.get::<GridPos>(a).unwrap(), GridPos { x: 5, y: 5 });
+    }
+
+    #[test]
+    fn bump_count_resets_on_successful_move() {
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        });
+        world.insert_resource(dummy_resource_assets());
+        let a = world
+            .spawn((
+                Worker,
+                GridPos { x: 5, y: 5 },
+                Inventory::default(),
+                NavState::default(),
+                BumpCount(7),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::Move(Direction::East)],
+                    pc: 0,
+                },
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert_eq!(
+            world.get::<BumpCount>(a).unwrap().0,
+            0,
+            "successful step must reset the bump counter"
+        );
+        assert_eq!(*world.get::<GridPos>(a).unwrap(), GridPos { x: 6, y: 5 });
+    }
+
+    // Build a world where the worker at (5,5) bumps a wall every tick, seed
+    // it one tick from MAX_BUMPS so the next tick triggers the despawn-spill,
+    // run step_workers once, and report what's left at (5,5).
+    fn run_despawn_with_inventory(carried: usize) -> (bool, usize) {
+        let mut w = flat_grass_world();
+        place(&mut w, 5, 4, Terrain::Wall);
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(w);
+        world.insert_resource(dummy_resource_assets());
+
+        let queue: VecDeque<ResourceKind> =
+            std::iter::repeat(ResourceKind::Energy).take(carried).collect();
+        let a = world
+            .spawn((
+                Worker,
+                GridPos { x: 5, y: 5 },
+                Inventory { queue },
+                NavState::default(),
+                BumpCount(MAX_BUMPS - 1),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::Move(Direction::North)],
+                    pc: 0,
+                },
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        let despawned = world.get_entity(a).is_err();
+        let spilled = world
+            .query::<(&ResourceNode, &GridPos)>()
+            .iter(&world)
+            .filter(|(_, p)| **p == GridPos { x: 5, y: 5 })
+            .count();
+        (despawned, spilled)
+    }
+
+    #[test]
+    fn worker_despawns_and_spills_inventory_at_max_bumps() {
+        // Inventory::CAPACITY = 2, so the worker can carry at most 2 items.
+        let (despawned, spilled) = run_despawn_with_inventory(Inventory::CAPACITY);
+        assert!(despawned, "worker should despawn at MAX_BUMPS");
+        assert_eq!(
+            spilled,
+            Inventory::CAPACITY,
+            "expected one ResourceNode per carried item"
+        );
+    }
+
+    #[test]
+    fn empty_inventory_despawn_spills_nothing() {
+        let (despawned, spilled) = run_despawn_with_inventory(0);
+        assert!(despawned);
+        assert_eq!(spilled, 0);
     }
 
     // --- step_workers pickup contention -------------------------------------
