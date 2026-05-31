@@ -89,8 +89,10 @@ enum ResourceKind {
 }
 
 impl ResourceKind {
-    const COUNT: usize = 3;
-    const ALL: [ResourceKind; Self::COUNT] = [Self::Energy, Self::Grass, Self::Wood];
+    // ALL is the single source of truth for the kind list; COUNT derives
+    // from it so the two can't drift if a new variant is added.
+    const ALL: [Self; 3] = [Self::Energy, Self::Grass, Self::Wood];
+    const COUNT: usize = Self::ALL.len();
 
     fn label(self) -> &'static str {
         match self {
@@ -375,9 +377,10 @@ struct CarrySlot(usize);
 // silently-missing slot at runtime.
 const CARRY_SLOT_Y: [f32; Inventory::CAPACITY] = [0.55, 0.85];
 
-// FIFO queue of carried resources, bounded to CAPACITY. A pickup beyond
-// capacity evicts the oldest entry — that resource is lost (not deposited at
-// base and not respawned on the ground), so the worker can't hoard.
+// FIFO queue of carried resources, bounded to CAPACITY. On overflow, `push`
+// returns the evicted oldest entry to the caller — step_workers' Pickup arm
+// respawns it onto the worker's tile as a fresh ResourceNode so it remains
+// collectible.
 #[derive(Component, Default)]
 struct Inventory {
     queue: VecDeque<ResourceKind>,
@@ -820,12 +823,12 @@ fn spawn_worker(
             // Carry-slot indicators above the worker. Hidden until the worker
             // picks something up; update_carry_display swaps the material and
             // visibility from the Inventory queue each frame.
-            for slot in 0..Inventory::CAPACITY {
+            for (slot, &slot_y) in CARRY_SLOT_Y.iter().enumerate().take(Inventory::CAPACITY) {
                 p.spawn((
                     CarrySlot(slot),
                     Mesh3d(assets.slot_mesh.clone()),
                     MeshMaterial3d(assets.slot_placeholder_mat.clone()),
-                    Transform::from_xyz(0.0, CARRY_SLOT_Y[slot], 0.0),
+                    Transform::from_xyz(0.0, slot_y, 0.0),
                     Visibility::Hidden,
                 ));
             }
@@ -1100,7 +1103,7 @@ fn step_workers(
                     // oldest item is dropped back onto the worker's tile as
                     // a fresh ResourceNode so it remains collectible.
                     let hit = resource_q.iter().find(|(_, rpos, res)| {
-                        **rpos == *pos && filter.map_or(true, |want| res.kind == want)
+                        **rpos == *pos && filter.is_none_or(|want| res.kind == want)
                     });
                     if let Some((ent, _, res)) = hit {
                         commands.entity(ent).despawn();
