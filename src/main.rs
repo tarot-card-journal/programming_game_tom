@@ -1224,7 +1224,10 @@ fn step_workers(
                 let make_plan = |start: GridPos,
                                  claims: &HashSet<GridPos>,
                                  blocked: &HashSet<GridPos>| {
-                    let targets: Vec<GridPos> = match target {
+                    // HashSet (not Vec) so `is_target` in BFS is O(1); the
+                    // dev-mode dense energy cluster + frequent re-plans
+                    // make this contention-sensitive.
+                    let targets: HashSet<GridPos> = match target {
                         Target::Resource(kind) => resource_q
                             .iter()
                             .filter(|(_, _, r)| r.kind == kind)
@@ -1289,9 +1292,10 @@ fn step_workers(
                         } else {
                             // No detour exists (corridor, dead end, etc.).
                             // Sidestep into any open neighbor other than the
-                            // bumped direction so the standoff breaks. Order
-                            // is the CARDINAL_DIRS rotation; deterministic
-                            // but varies by which direction got bumped.
+                            // bumped direction so the standoff breaks. We
+                            // iterate CARDINAL_DIRS in its fixed [N, S, E, W]
+                            // order, skipping the bumped direction — the
+                            // first cardinal that's free wins.
                             for sidestep in CARDINAL_DIRS {
                                 if sidestep == dir {
                                     continue;
@@ -2416,7 +2420,7 @@ mod tests {
         world.insert_resource(dummy_resource_assets());
 
         let queue: VecDeque<ResourceKind> =
-            std::iter::repeat(ResourceKind::Energy).take(carried).collect();
+            std::iter::repeat_n(ResourceKind::Energy, carried).collect();
         let a = world
             .spawn((
                 Worker,
