@@ -735,8 +735,8 @@ fn setup(
             if !matches!(world.get(gx, gy), Some(t) if t.passable()) {
                 continue;
             }
-            if energy_positions.insert(pos) {
-                commands.spawn((EnergyNode, pos));
+            if resource_positions.insert(pos) {
+                spawn_resource_node(&mut commands, &resource_assets, ResourceKind::Energy, pos);
             }
         }
     }
@@ -1258,8 +1258,8 @@ fn step_workers(
                 if let Some(&dir) = nav.plan.front() {
                     if step_in_direction(
                         &world,
-                        &mut *pos,
-                        &mut *facing,
+                        &mut pos,
+                        &mut facing,
                         dir,
                         &mut occupied,
                     ) {
@@ -1298,8 +1298,8 @@ fn step_workers(
                                 }
                                 if step_in_direction(
                                     &world,
-                                    &mut *pos,
-                                    &mut *facing,
+                                    &mut pos,
+                                    &mut facing,
                                     sidestep,
                                     &mut occupied,
                                 ) {
