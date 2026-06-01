@@ -14,6 +14,12 @@ const NUM_WORKERS: usize = 10;
 // alone. The counter resets on any successful step, so productive workers
 // never die.
 const MAX_BUMPS: u32 = 10;
+// Ticks between a worker's death and a fresh replacement appearing at START.
+// Each death queues an independent timer — multiple deaths build in parallel.
+const RESPAWN_DELAY_TICKS: u64 = 10;
+// Per-worker per-tick chance (out of 100) of spontaneously exploding. Forces
+// regular deaths so respawn + UI behavior gets exercised during normal play.
+const EXPLOSION_CHANCE_PERCENT: u32 = 1;
 const CARDINAL_DIRS: [Direction; 4] = [
     Direction::North,
     Direction::South,
@@ -551,10 +557,34 @@ fn spawn_resource_node(
 #[derive(Resource, Default)]
 struct Tick(u64);
 
+// Pending worker rebuilds. Each entry is the absolute tick at which a fresh
+// worker should appear at START. respawn_workers drains entries whose due
+// tick has passed; multiple deaths build in parallel.
+#[derive(Resource, Default)]
+struct RespawnQueue {
+    pending: Vec<u64>,
+}
+
+// Per-tick percent chance a worker spontaneously explodes. Defaults to
+// EXPLOSION_CHANCE_PERCENT in the live app; tests insert this resource at 0
+// to disable randomness, or at 100 to force every tick.
+#[derive(Resource, Copy, Clone)]
+struct ExplosionChance(u32);
+
+impl Default for ExplosionChance {
+    fn default() -> Self {
+        Self(EXPLOSION_CHANCE_PERCENT)
+    }
+}
+
 #[derive(Resource)]
 struct Editor {
     source: String,
     status: String,
+    // Last successfully compiled program. Respawn_workers reads this so a
+    // worker that dies after the player edited the script comes back with
+    // the current version.
+    compiled_program: Vec<Action>,
 }
 
 const DEFAULT_PROGRAM: &str = "\
@@ -576,6 +606,10 @@ impl Default for Editor {
         Self {
             source: DEFAULT_PROGRAM.into(),
             status: "Compile a program to load it onto the worker.".into(),
+            // DEFAULT_PROGRAM is hand-authored and known to parse — falling
+            // back to an empty Vec if it ever doesn't keeps Editor::default()
+            // infallible.
+            compiled_program: parse_program(DEFAULT_PROGRAM).unwrap_or_default(),
         }
     }
 }
@@ -594,6 +628,8 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.09)))
         .insert_resource(Tick::default())
         .insert_resource(Editor::default())
+        .insert_resource(RespawnQueue::default())
+        .insert_resource(ExplosionChance::default())
         .insert_resource(Time::<Fixed>::from_hz(4.0))
         .add_systems(Startup, setup)
         .add_systems(
@@ -612,6 +648,7 @@ fn main() {
                 advance_tick,
                 snapshot_anim_state,
                 step_workers,
+                respawn_workers,
                 sync_anim_current,
             )
                 .chain(),
@@ -798,12 +835,15 @@ fn setup(
     for grid_pos in worker_starts {
         spawn_worker(&mut commands, grid_pos, initial.clone(), initial_yaw, &assets);
     }
+    commands.insert_resource(assets);
     commands.insert_resource(resource_assets);
 }
 
 // Mesh/material handles shared across every worker spawn. Bundling them keeps
 // spawn_worker's signature short and makes "one extra clone per worker" the
-// obvious cost model.
+// obvious cost model. Lives as a Resource so respawn_workers can pull it
+// when a death enqueues a fresh worker.
+#[derive(Resource)]
 struct WorkerAssets {
     body_mesh: Handle<Mesh>,
     body_mat: Handle<StandardMaterial>,
@@ -1101,12 +1141,62 @@ fn advance_tick(mut tick: ResMut<Tick>) {
     tick.0 = tick.0.wrapping_add(1);
 }
 
+// Drains RespawnQueue entries whose due tick has arrived, spawning a fresh
+// worker at a free start cell for each one. The new worker runs the editor's
+// last-compiled program so script edits the player made between death and
+// rebuild are respected.
+fn respawn_workers(
+    mut commands: Commands,
+    tick: Res<Tick>,
+    mut queue: ResMut<RespawnQueue>,
+    world: Res<World>,
+    editor: Res<Editor>,
+    worker_assets: Res<WorkerAssets>,
+    workers: Query<&GridPos, With<Worker>>,
+) {
+    // Partition pending entries into due (now) and waiting (future).
+    let current = tick.0;
+    let due = queue.pending.iter().filter(|&&t| t <= current).count();
+    if due == 0 {
+        return;
+    }
+    queue.pending.retain(|&t| t > current);
+
+    // Avoid landing on a still-living worker (BFS will skip these but still
+    // expand through them).
+    let occupied: HashSet<GridPos> = workers.iter().copied().collect();
+    let spawn_cells = worker_start_positions(&world, START, due, &occupied);
+
+    let initial_yaw = editor
+        .compiled_program
+        .iter()
+        .find_map(|a| match a {
+            Action::Move(d) => Some(d.yaw()),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+
+    for pos in spawn_cells {
+        spawn_worker(
+            &mut commands,
+            pos,
+            editor.compiled_program.clone(),
+            initial_yaw,
+            &worker_assets,
+        );
+    }
+}
+
 // Bevy's Query<Data, Filter> signatures are inherently nested; a type alias
-// per system body would be more noise than the inline form.
-#[allow(clippy::type_complexity)]
+// per system body would be more noise than the inline form. The arg count
+// is similarly inherent — Bevy resolves system params positionally.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn step_workers(
     world: Res<World>,
     assets: Res<ResourceAssets>,
+    tick: Res<Tick>,
+    explosion_chance: Res<ExplosionChance>,
+    mut respawn_queue: ResMut<RespawnQueue>,
     mut commands: Commands,
     resource_q: Query<
         (Entity, &GridPos, &ResourceNode),
@@ -1154,6 +1244,26 @@ fn step_workers(
         .collect();
 
     for (entity, mut pos, mut prog, mut facing, mut inv, mut nav, mut bumps) in &mut workers {
+        // Random explosion: 1% chance per tick per worker. Forces deaths
+        // to happen during normal play so respawn + UI keep getting
+        // exercised. Same despawn-and-spill code path as the MAX_BUMPS
+        // stuck-worker case, so worker tile, occupancy, claims all line up
+        // for the rest of this tick — we just stop processing this worker.
+        if should_explode(tick.0, entity.index_u32(), explosion_chance.0) {
+            occupied.remove(&*pos);
+            despawn_with_spill(
+                &mut commands,
+                entity,
+                *pos,
+                &mut inv,
+                &mut nav,
+                &assets,
+                &mut resource_claims,
+                &mut respawn_queue,
+                tick.0,
+            );
+            continue;
+        }
         if prog.instructions.is_empty() {
             continue;
         }
@@ -1335,17 +1445,18 @@ fn step_workers(
             } else if blocked {
                 bumps.0 += 1;
                 if bumps.0 >= MAX_BUMPS {
-                    // Release any outstanding resource reservation so later
-                    // workers in this same tick can target the tile.
-                    if let Some(prev) = nav.reserved_tile.take() {
-                        resource_claims.remove(&prev);
-                    }
-                    // Spill every carried resource back onto the worker's
-                    // tile as a fresh ResourceNode so others can collect.
-                    while let Some(kind) = inv.queue.pop_front() {
-                        spawn_resource_node(&mut commands, &assets, kind, *pos);
-                    }
-                    commands.entity(entity).despawn();
+                    occupied.remove(&*pos);
+                    despawn_with_spill(
+                        &mut commands,
+                        entity,
+                        *pos,
+                        &mut inv,
+                        &mut nav,
+                        &assets,
+                        &mut resource_claims,
+                        &mut respawn_queue,
+                        tick.0,
+                    );
                 }
             }
         }
@@ -1355,6 +1466,40 @@ fn step_workers(
 // Walks a plan from `start` and returns the cell it terminates at. Used to
 // derive the destination of a BFS path so it can be reserved without changing
 // find_path's signature.
+// Centralizes the death sequence: release any reservation, drop carried
+// resources back onto the tile, despawn the entity, and queue a respawn
+// timer. Shared by the MAX_BUMPS-stuck path and the per-tick explosion roll.
+#[allow(clippy::too_many_arguments)]
+fn despawn_with_spill(
+    commands: &mut Commands,
+    entity: Entity,
+    pos: GridPos,
+    inv: &mut Inventory,
+    nav: &mut NavState,
+    assets: &ResourceAssets,
+    resource_claims: &mut HashSet<GridPos>,
+    respawn_queue: &mut RespawnQueue,
+    current_tick: u64,
+) {
+    if let Some(prev) = nav.reserved_tile.take() {
+        resource_claims.remove(&prev);
+    }
+    while let Some(kind) = inv.queue.pop_front() {
+        spawn_resource_node(commands, assets, kind, pos);
+    }
+    commands.entity(entity).despawn();
+    respawn_queue.pending.push(current_tick + RESPAWN_DELAY_TICKS);
+}
+
+// Deterministic per-worker per-tick explosion roll. Returns true with
+// approximately `chance_percent` probability — varies by tick AND entity
+// index so different workers don't all explode together. Tests pass 0 to
+// disable.
+fn should_explode(current_tick: u64, entity_index: u32, chance_percent: u32) -> bool {
+    chance_percent > 0
+        && tile_hash(current_tick as i32, entity_index as i32) % 100 < chance_percent
+}
+
 fn path_destination(start: GridPos, plan: &VecDeque<Direction>) -> GridPos {
     let mut p = start;
     for d in plan {
@@ -1525,6 +1670,7 @@ fn editor_ui(
     mut q: Query<(&mut Program, &Inventory, &mut NavState), With<Worker>>,
     bases: Query<&Base>,
     tick: Res<Tick>,
+    respawn_queue: Res<RespawnQueue>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else { return };
     egui::SidePanel::left("editor")
@@ -1557,6 +1703,9 @@ fn editor_ui(
                             // the old script was targeting.
                             *nav = NavState::default();
                         }
+                        // Cache the freshly compiled program so respawned
+                        // workers also pick up the new script.
+                        editor.compiled_program = instrs;
                         editor.status = format!("Loaded {n} instruction(s).");
                     }
                     Err(e) => {
@@ -1579,6 +1728,23 @@ fn editor_ui(
                     prog.pc,
                     prog.instructions.len()
                 ));
+            }
+            if !respawn_queue.pending.is_empty() {
+                ui.label(format!("building: {}", respawn_queue.pending.len()));
+                // Sort soonest-due first so the most-progressed bar is on
+                // top. The shared timer length means progress = elapsed
+                // ticks / RESPAWN_DELAY_TICKS.
+                let mut due: Vec<u64> = respawn_queue.pending.iter().copied().collect();
+                due.sort();
+                for due_tick in due {
+                    let ticks_left = due_tick.saturating_sub(tick.0);
+                    let elapsed = RESPAWN_DELAY_TICKS.saturating_sub(ticks_left);
+                    let progress = elapsed as f32 / RESPAWN_DELAY_TICKS as f32;
+                    ui.add(
+                        egui::ProgressBar::new(progress.clamp(0.0, 1.0))
+                            .text(format!("{elapsed}/{RESPAWN_DELAY_TICKS}")),
+                    );
+                }
             }
             // Sum each kind across all worker inventories. Per-worker queue
             // contents aren't shown — that'd need N panels for N workers.
@@ -1926,6 +2092,14 @@ mod tests {
         inv.queue.iter().filter(|&&k| k == kind).count() as u32
     }
 
+    // Insert the resources that step_workers needs beyond World + assets.
+    // Most tests want explosions disabled (chance = 0) so they aren't flaky.
+    fn install_step_workers_resources(world: &mut bevy::ecs::world::World) {
+        world.insert_resource(Tick::default());
+        world.insert_resource(RespawnQueue::default());
+        world.insert_resource(ExplosionChance(0));
+    }
+
     // Spawn a stationary worker that runs Wait forever — useful as an
     // obstacle in occupancy tests.
     fn spawn_blocker(world: &mut bevy::ecs::world::World, pos: GridPos) {
@@ -1984,6 +2158,7 @@ mod tests {
         let w1 = spawn_navigator(&mut world, GridPos { x: 5, y: 5 });
         let w2 = spawn_navigator(&mut world, GridPos { x: 5, y: 5 });
 
+        install_step_workers_resources(&mut world);
         let mut schedule = Schedule::default();
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
@@ -2057,6 +2232,7 @@ mod tests {
             ))
             .id();
 
+        install_step_workers_resources(&mut world);
         let mut schedule = Schedule::default();
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
@@ -2106,6 +2282,7 @@ mod tests {
             ))
             .id();
 
+        install_step_workers_resources(&mut world);
         let mut schedule = Schedule::default();
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
@@ -2207,6 +2384,7 @@ mod tests {
             .id();
         spawn_blocker(&mut world, GridPos { x: 5, y: 4 });
 
+        install_step_workers_resources(&mut world);
         let mut schedule = Schedule::default();
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
@@ -2278,6 +2456,7 @@ mod tests {
             .id();
         spawn_blocker(&mut world, GridPos { x: 5, y: 4 });
 
+        install_step_workers_resources(&mut world);
         let mut schedule = Schedule::default();
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
@@ -2325,6 +2504,7 @@ mod tests {
             .id();
         spawn_blocker(&mut world, GridPos { x: 5, y: 4 });
 
+        install_step_workers_resources(&mut world);
         let mut schedule = Schedule::default();
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
@@ -2364,6 +2544,7 @@ mod tests {
             ))
             .id();
 
+        install_step_workers_resources(&mut world);
         let mut schedule = Schedule::default();
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
@@ -2397,6 +2578,7 @@ mod tests {
             ))
             .id();
 
+        install_step_workers_resources(&mut world);
         let mut schedule = Schedule::default();
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
@@ -2439,6 +2621,7 @@ mod tests {
             ))
             .id();
 
+        install_step_workers_resources(&mut world);
         let mut schedule = Schedule::default();
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
@@ -2506,6 +2689,7 @@ mod tests {
         let w1 = make_worker(&mut world);
         let w2 = make_worker(&mut world);
 
+        install_step_workers_resources(&mut world);
         let mut schedule = Schedule::default();
         schedule.add_systems(step_workers);
         schedule.run(&mut world);
@@ -2717,5 +2901,146 @@ navigate_to(closest, base)
                 assert!((0.0..=1.0).contains(&n), "value_noise({x},{y}) = {n}");
             }
         }
+    }
+
+    // --- explosion + respawn -------------------------------------------------
+
+    #[test]
+    fn should_explode_returns_false_when_chance_is_zero() {
+        // Sample a range — none should ever fire.
+        for tick in 0..1000u64 {
+            for ent in 0..10u32 {
+                assert!(!should_explode(tick, ent, 0), "tick={tick} ent={ent}");
+            }
+        }
+    }
+
+    #[test]
+    fn should_explode_returns_true_when_chance_is_100() {
+        for tick in 0..50u64 {
+            for ent in 0..5u32 {
+                assert!(should_explode(tick, ent, 100));
+            }
+        }
+    }
+
+    #[test]
+    fn should_explode_is_deterministic_per_tick_and_entity() {
+        // Same inputs → same output, every time.
+        for tick in [0, 7, 100, 9999].iter().copied() {
+            for ent in [0, 1, 2, 17, 42].iter().copied() {
+                let a = should_explode(tick, ent, 1);
+                let b = should_explode(tick, ent, 1);
+                assert_eq!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn should_explode_rate_is_roughly_one_percent() {
+        // Sample 10k rolls and verify the rate is within reasonable bounds
+        // of 1%. Deterministic hash so the bound can be tight without flake.
+        let mut hits = 0u32;
+        let trials = 10_000u32;
+        for tick in 0..100u64 {
+            for ent in 0..100u32 {
+                if should_explode(tick, ent, 1) {
+                    hits += 1;
+                }
+            }
+        }
+        // Expect ~100. Allow [60, 160] as wiggle room for hash distribution.
+        assert!(
+            (60..=160).contains(&hits),
+            "expected ~1% of {trials} rolls, got {hits}"
+        );
+    }
+
+    #[test]
+    fn max_bumps_despawn_enqueues_respawn_after_delay() {
+        let mut w = flat_grass_world();
+        place(&mut w, 5, 4, Terrain::Wall);
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(w);
+        world.insert_resource(dummy_resource_assets());
+
+        world.spawn((
+            Worker,
+            GridPos { x: 5, y: 5 },
+            Inventory::default(),
+            NavState::default(),
+            BumpCount(MAX_BUMPS - 1),
+            Facing {
+                prev_yaw: 0.0,
+                current_yaw: 0.0,
+            },
+            Program {
+                instructions: vec![Action::Move(Direction::North)],
+                pc: 0,
+            },
+        ));
+
+        // Seed tick at a known value so the due tick is predictable.
+        world.insert_resource(Tick(50));
+        world.insert_resource(RespawnQueue::default());
+        world.insert_resource(ExplosionChance(0));
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        let queue = world.resource::<RespawnQueue>();
+        assert_eq!(
+            queue.pending,
+            vec![50 + RESPAWN_DELAY_TICKS],
+            "death at tick 50 should queue a respawn at tick 50 + RESPAWN_DELAY_TICKS"
+        );
+    }
+
+    #[test]
+    fn explosion_despawns_and_queues_respawn() {
+        // ExplosionChance(100) forces a death on the very first tick.
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        });
+        world.insert_resource(dummy_resource_assets());
+
+        let queue: VecDeque<ResourceKind> = std::iter::repeat_n(ResourceKind::Energy, 1).collect();
+        let a = world
+            .spawn((
+                Worker,
+                GridPos { x: 5, y: 5 },
+                Inventory { queue },
+                NavState::default(),
+                BumpCount::default(),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions: vec![Action::Wait],
+                    pc: 0,
+                },
+            ))
+            .id();
+
+        world.insert_resource(Tick(7));
+        world.insert_resource(RespawnQueue::default());
+        world.insert_resource(ExplosionChance(100));
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert!(world.get_entity(a).is_err(), "explosion should despawn");
+        let spilled = world
+            .query::<(&ResourceNode, &GridPos)>()
+            .iter(&world)
+            .filter(|(_, p)| **p == GridPos { x: 5, y: 5 })
+            .count();
+        assert_eq!(spilled, 1, "carried item should spill onto tile");
+        assert_eq!(
+            world.resource::<RespawnQueue>().pending,
+            vec![7 + RESPAWN_DELAY_TICKS]
+        );
     }
 }
