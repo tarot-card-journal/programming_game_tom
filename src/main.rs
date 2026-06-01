@@ -73,6 +73,19 @@ enum Action {
     Pickup(Option<ResourceKind>),
     Drop,
     NavigateTo(NavQualifier, Target),
+    // Branching IR — emitted by the parser when compiling if/else and
+    // while/until blocks. Users don't write these directly; they're flat-IR
+    // equivalents of the block syntax. The usize is an instruction index
+    // into the same Program.
+    Jump(usize),
+    JumpIf(Condition, usize),
+    JumpUnless(Condition, usize),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Condition {
+    // True when the worker's inventory queue contains at least one of this kind.
+    Carrying(ResourceKind),
 }
 
 // Per-tick tile lock key. Each (GridPos, TileAction) pair can be acquired at
@@ -558,15 +571,12 @@ struct Editor {
 }
 
 const DEFAULT_PROGRAM: &str = "\
-# Gather energy, grass, and wood, then deliver them home.
-# Comments start with '#'. One instruction per line.
-# `pickup(kind)` filters by kind — useful when tiles overlap.
-navigate_to(closest, energy)
-pickup(energy)
-navigate_to(closest, grass)
-pickup(grass)
-navigate_to(closest, wood)
-pickup(wood)
+# Gather one energy, then deliver. The outer pc still wraps at end-of-program,
+# so this restarts forever. Comments start with '#'.
+while not carrying(energy) {
+  navigate_to(closest, energy)
+  pickup(energy)
+}
 navigate_to(closest, base)
 drop
 ";
@@ -1040,8 +1050,53 @@ fn grid_to_world(gx: i32, gy: i32) -> (f32, f32) {
     (ox + gx as f32, oz + gy as f32)
 }
 
+// Open block tracked during parsing. The held usize is the instruction index
+// of a pending Jump/JumpUnless whose target needs to be patched once we see
+// the closing `}` or `} else {`.
+enum BlockFrame {
+    // Open `if`. The held index is the JumpUnless that should land at the
+    // start of an `else` (if one appears) or at the first instruction past
+    // the body (otherwise). `line` is the line number of the opening `if`
+    // so unclosed-block errors can point at the right place.
+    If { skip_body_jump: usize, line: usize },
+    // Open `else`. The held index is the Jump that should skip past the
+    // else body once we see `}`. `line` is the `} else {` line.
+    Else { skip_else_jump: usize, line: usize },
+    // Open `while`. `exit_jump` is the JumpUnless/JumpIf at the top of the
+    // loop (which depends on whether the user wrote `while cond` or
+    // `while not cond`); `loop_start` is the index to jump back to from
+    // the bottom. `pending_breaks` collects indices of break-jumps that
+    // need their target patched to the loop's end when `}` closes it.
+    Loop {
+        exit_jump: usize,
+        loop_start: usize,
+        line: usize,
+        pending_breaks: Vec<usize>,
+    },
+}
+
+impl BlockFrame {
+    fn opened_at(&self) -> usize {
+        match self {
+            BlockFrame::If { line, .. }
+            | BlockFrame::Else { line, .. }
+            | BlockFrame::Loop { line, .. } => *line,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            BlockFrame::If { .. } => "if",
+            BlockFrame::Else { .. } => "else",
+            BlockFrame::Loop { .. } => "while",
+        }
+    }
+}
+
 fn parse_program(src: &str) -> Result<Vec<Action>, String> {
-    let mut out = Vec::new();
+    let mut out: Vec<Action> = Vec::new();
+    let mut frames: Vec<BlockFrame> = Vec::new();
+
     for (i, line) in src.lines().enumerate() {
         let code = line.split('#').next().unwrap_or("").trim();
         if code.is_empty() {
@@ -1049,10 +1104,134 @@ fn parse_program(src: &str) -> Result<Vec<Action>, String> {
         }
         // Normalize paren/comma syntax to whitespace so navigate_to(closest,
         // energy) and navigate_to closest energy both parse the same way.
+        // Braces are kept as standalone tokens — pad with spaces so they
+        // tokenize cleanly even when adjacent to other words (e.g. `cond){`).
         let normalized = code
             .replace(['(', ')', ','], " ")
+            .replace('{', " { ")
+            .replace('}', " } ")
             .to_ascii_lowercase();
         let words: Vec<&str> = normalized.split_whitespace().collect();
+
+        // Block control: `if cond {`, `} else {`, `while cond {`, `until cond {`,
+        // `}`. These don't push an action of their own; they push/pop frames
+        // and emit synthetic jumps.
+        match words.as_slice() {
+            ["if", cond_tokens @ .., "{"] => {
+                let expr = parse_cond_expr(cond_tokens).map_err(|e| {
+                    format!("line {}: {}", i + 1, e)
+                })?;
+                let idx = out.len();
+                out.push(cond_jump(expr));
+                frames.push(BlockFrame::If {
+                    skip_body_jump: idx,
+                    line: i + 1,
+                });
+                continue;
+            }
+            ["while", cond_tokens @ .., "{"] => {
+                let expr = parse_cond_expr(cond_tokens).map_err(|e| {
+                    format!("line {}: {}", i + 1, e)
+                })?;
+                // Positive cond → JumpUnless (exit when false, i.e. loop
+                // while true). Negated `not` cond → JumpIf (exit when true,
+                // i.e. loop until cond becomes true).
+                let loop_start = out.len();
+                let exit_jump = out.len();
+                out.push(cond_jump(expr));
+                frames.push(BlockFrame::Loop {
+                    exit_jump,
+                    loop_start,
+                    line: i + 1,
+                    pending_breaks: Vec::new(),
+                });
+                continue;
+            }
+            ["break"] => {
+                // Find the innermost enclosing loop and queue a placeholder
+                // jump to be patched when the loop closes. If/Else frames
+                // are skipped so `break` inside nested `if`s still targets
+                // the surrounding loop.
+                let pending_breaks = frames.iter_mut().rev().find_map(|f| match f {
+                    BlockFrame::Loop { pending_breaks, .. } => Some(pending_breaks),
+                    _ => None,
+                });
+                let pending_breaks = pending_breaks.ok_or_else(|| {
+                    format!("line {}: `break` outside a loop", i + 1)
+                })?;
+                let idx = out.len();
+                out.push(Action::Jump(usize::MAX));
+                pending_breaks.push(idx);
+                continue;
+            }
+            ["continue"] => {
+                // Continue jumps to the loop's top (where the condition is
+                // re-evaluated). Target is known immediately, no patching.
+                let loop_start = frames.iter().rev().find_map(|f| match f {
+                    BlockFrame::Loop { loop_start, .. } => Some(*loop_start),
+                    _ => None,
+                });
+                let loop_start = loop_start.ok_or_else(|| {
+                    format!("line {}: `continue` outside a loop", i + 1)
+                })?;
+                out.push(Action::Jump(loop_start));
+                continue;
+            }
+            ["}", "else", "{"] => {
+                let Some(BlockFrame::If { skip_body_jump, .. }) = frames.pop() else {
+                    return Err(format!(
+                        "line {}: `else` without a matching `if`",
+                        i + 1
+                    ));
+                };
+                // Emit Jump-past-else; patch the if's JumpUnless to land just
+                // after it (= start of else body).
+                let end_jump = out.len();
+                out.push(Action::Jump(usize::MAX));
+                let else_start = out.len();
+                patch_jump_target(&mut out[skip_body_jump], else_start);
+                frames.push(BlockFrame::Else {
+                    skip_else_jump: end_jump,
+                    line: i + 1,
+                });
+                continue;
+            }
+            ["}"] => {
+                let frame = frames.pop().ok_or_else(|| {
+                    format!("line {}: unmatched `}}`", i + 1)
+                })?;
+                // For all three block kinds, closing `}` patches one or more
+                // pending jumps to land just past the block. Loops also emit
+                // a back-jump first so the body iterates, then patch any
+                // collected break-jumps to the same end address.
+                match frame {
+                    BlockFrame::If { skip_body_jump, .. } => {
+                        let block_end = out.len();
+                        patch_jump_target(&mut out[skip_body_jump], block_end);
+                    }
+                    BlockFrame::Else { skip_else_jump, .. } => {
+                        let block_end = out.len();
+                        patch_jump_target(&mut out[skip_else_jump], block_end);
+                    }
+                    BlockFrame::Loop {
+                        exit_jump,
+                        loop_start,
+                        pending_breaks,
+                        ..
+                    } => {
+                        out.push(Action::Jump(loop_start));
+                        let block_end = out.len();
+                        patch_jump_target(&mut out[exit_jump], block_end);
+                        for brk in pending_breaks {
+                            patch_jump_target(&mut out[brk], block_end);
+                        }
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+
         let action = match words.as_slice() {
             ["n"] | ["north"] | ["up"] => Action::Move(Direction::North),
             ["s"] | ["south"] | ["down"] => Action::Move(Direction::South),
@@ -1091,14 +1270,86 @@ fn parse_program(src: &str) -> Result<Vec<Action>, String> {
         };
         out.push(action);
     }
+
+    if let Some(frame) = frames.first() {
+        return Err(format!(
+            "unclosed `{}` block opened on line {}",
+            frame.kind(),
+            frame.opened_at()
+        ));
+    }
     if out.is_empty() {
         return Err("program is empty".into());
     }
     Ok(out)
 }
 
+// Set the target of a Jump or JumpUnless that was pushed with a placeholder.
+// Callers guarantee `action` is one of those two variants — anything else is
+// a parser bug, not a user error.
+fn patch_jump_target(action: &mut Action, target: usize) {
+    match action {
+        Action::Jump(t) | Action::JumpIf(_, t) | Action::JumpUnless(_, t) => *t = target,
+        _ => unreachable!("patch_jump_target called on non-jump action"),
+    }
+}
+
+// A parsed condition expression: a positive `Condition` plus a `negated`
+// flag for leading `not`. Kept as a flag rather than `Condition::Not(...)`
+// so `Condition` stays Copy and the IR jump variants (JumpIf/JumpUnless)
+// directly express both polarities without extra runtime negation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct CondExpr {
+    condition: Condition,
+    negated: bool,
+}
+
+fn parse_cond_expr(words: &[&str]) -> Result<CondExpr, String> {
+    match words {
+        ["not", rest @ ..] => Ok(CondExpr {
+            condition: parse_condition(rest)?,
+            negated: true,
+        }),
+        _ => Ok(CondExpr {
+            condition: parse_condition(words)?,
+            negated: false,
+        }),
+    }
+}
+
+fn parse_condition(words: &[&str]) -> Result<Condition, String> {
+    match words {
+        ["carrying", kind] => {
+            let kind = ResourceKind::from_token(kind)
+                .ok_or_else(|| format!("unknown resource kind '{}' in condition", kind))?;
+            Ok(Condition::Carrying(kind))
+        }
+        _ => Err(format!("unknown condition: `{}`", words.join(" "))),
+    }
+}
+
+// Build the loop-exit / if-skip jump that should be emitted at the top of
+// a conditional block. Positive cond → JumpUnless (exit/skip when false);
+// negated cond → JumpIf (exit/skip when true).
+fn cond_jump(expr: CondExpr) -> Action {
+    if expr.negated {
+        Action::JumpIf(expr.condition, usize::MAX)
+    } else {
+        Action::JumpUnless(expr.condition, usize::MAX)
+    }
+}
+
 fn advance_tick(mut tick: ResMut<Tick>) {
     tick.0 = tick.0.wrapping_add(1);
+}
+
+// Evaluate a branching condition against a worker's inventory. Pulled out
+// as a free function so it stays pure and new condition variants don't
+// muddy step_workers — match exhaustiveness will flag a missing arm here.
+fn evaluate_condition(cond: Condition, inv: &Inventory) -> bool {
+    match cond {
+        Condition::Carrying(kind) => inv.queue.contains(&kind),
+    }
 }
 
 // Bevy's Query<Data, Filter> signatures are inherently nested; a type alias
@@ -1320,6 +1571,25 @@ fn step_workers(
                 // found. A bump leaves us still trying to navigate.
                 advance_pc = !blocked && nav.plan.is_empty();
             }
+            // Branches are zero-tick: they move pc and the next tick executes
+            // the new instruction. Setting advance_pc = false suppresses the
+            // automatic +1 since we've already chosen the next pc directly.
+            Action::Jump(target) => {
+                prog.pc = target % prog.instructions.len();
+                advance_pc = false;
+            }
+            Action::JumpIf(cond, target) => {
+                if evaluate_condition(cond, &inv) {
+                    prog.pc = target % prog.instructions.len();
+                    advance_pc = false;
+                }
+            }
+            Action::JumpUnless(cond, target) => {
+                if !evaluate_condition(cond, &inv) {
+                    prog.pc = target % prog.instructions.len();
+                    advance_pc = false;
+                }
+            }
         }
         if advance_pc {
             prog.pc = (prog.pc + 1) % prog.instructions.len();
@@ -1519,6 +1789,153 @@ fn show_resource_counts(ui: &mut egui::Ui, header: &str, counts: &[u32; Resource
     }
 }
 
+// --- DSL syntax highlighter ----------------------------------------------
+
+// Token categories the editor colorizes. Punctuation/whitespace/unknown all
+// render in the default color; the three "named" categories — keyword
+// (control flow), verb (action), identifier (built-in argument) — each get
+// a distinct color so a quick visual scan tells you what each line does.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TokenKind {
+    Keyword,
+    Verb,
+    Identifier,
+    Comment,
+    Punctuation,
+    Whitespace,
+    Unknown,
+}
+
+// Highlighter palette tuned for the dark side-panel background. RGB values
+// borrowed from Atom's One Dark theme — they read well against #0d0e17 and
+// keep the keyword/verb/identifier groups visually distinct at small sizes.
+const KEYWORD_COLOR: egui::Color32 = egui::Color32::from_rgb(198, 120, 221); // purple
+const VERB_COLOR: egui::Color32 = egui::Color32::from_rgb(97, 175, 239); // blue
+const IDENTIFIER_COLOR: egui::Color32 = egui::Color32::from_rgb(229, 192, 123); // gold
+const COMMENT_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 120, 120); // gray
+
+// Hardcoded vocabulary lists. These mirror the parser's match arms — when a
+// new keyword or verb is added there, it must also be added here. A shared
+// source of truth would be cleaner but the two consumers want different
+// shapes (parser does slice-pattern matching, highlighter classifies one
+// identifier at a time), so the duplication is accepted for now.
+const KEYWORDS: &[&str] = &["if", "else", "while", "break", "continue", "not"];
+const VERBS: &[&str] = &[
+    "pickup",
+    "grab",
+    "take",
+    "drop",
+    "deposit",
+    "deliver",
+    "wait",
+    "noop",
+    "navigate_to",
+    "goto",
+    "nav",
+];
+const ARG_IDENTIFIERS: &[&str] = &[
+    "energy", "grass", "wood", "base", "carrying", "closest", "n", "s", "e", "w", "north", "south",
+    "east", "west", "up", "down", "left", "right",
+];
+
+fn classify_identifier(ident: &str) -> TokenKind {
+    let in_list = |list: &[&str]| list.iter().any(|w| ident.eq_ignore_ascii_case(w));
+    if in_list(KEYWORDS) {
+        TokenKind::Keyword
+    } else if in_list(VERBS) {
+        TokenKind::Verb
+    } else if in_list(ARG_IDENTIFIERS) {
+        TokenKind::Identifier
+    } else {
+        TokenKind::Unknown
+    }
+}
+
+// Lossless tokenization: every byte of `src` ends up in exactly one returned
+// slice, in order. The editor's layouter relies on this so the rendered
+// galley has the same character offsets as the source.
+fn tokenize(src: &str) -> Vec<(&str, TokenKind)> {
+    let mut out: Vec<(&str, TokenKind)> = Vec::new();
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Comment: `#` to end of line (exclusive of the trailing newline).
+        if b == b'#' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            out.push((&src[i..j], TokenKind::Comment));
+            i = j;
+            continue;
+        }
+        // Whitespace run (including newlines).
+        if b.is_ascii_whitespace() {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            out.push((&src[i..j], TokenKind::Whitespace));
+            i = j;
+            continue;
+        }
+        // Identifier: ASCII alnum + underscore. Covers all DSL names.
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let text = &src[i..j];
+            out.push((text, classify_identifier(text)));
+            i = j;
+            continue;
+        }
+        // Single-char punctuation (braces, parens, commas).
+        if matches!(b, b'{' | b'}' | b'(' | b')' | b',') {
+            out.push((&src[i..i + 1], TokenKind::Punctuation));
+            i += 1;
+            continue;
+        }
+        // Anything else (a stray symbol like ':', or non-ASCII pasted into a
+        // comment) — emit as Unknown using a char-aware length so we never
+        // slice across a UTF-8 codepoint boundary.
+        let ch_len = src[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        out.push((&src[i..i + ch_len], TokenKind::Unknown));
+        i += ch_len;
+    }
+    out
+}
+
+fn color_for(kind: TokenKind, default: egui::Color32) -> egui::Color32 {
+    match kind {
+        TokenKind::Keyword => KEYWORD_COLOR,
+        TokenKind::Verb => VERB_COLOR,
+        TokenKind::Identifier => IDENTIFIER_COLOR,
+        TokenKind::Comment => COMMENT_COLOR,
+        TokenKind::Punctuation | TokenKind::Whitespace | TokenKind::Unknown => default,
+    }
+}
+
+fn highlight_layout(src: &str, style: &egui::Style) -> egui::text::LayoutJob {
+    let font_id = egui::TextStyle::Monospace.resolve(style);
+    let default_color = style.visuals.text_color();
+    let mut job = egui::text::LayoutJob::default();
+    for (text, kind) in tokenize(src) {
+        job.append(
+            text,
+            0.0,
+            egui::TextFormat {
+                font_id: font_id.clone(),
+                color: color_for(kind, default_color),
+                italics: matches!(kind, TokenKind::Comment),
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
 fn editor_ui(
     mut contexts: EguiContexts,
     mut editor: ResMut<Editor>,
@@ -1535,14 +1952,23 @@ fn editor_ui(
             ui.monospace("N S E W Wait Drop");
             ui.monospace("pickup [energy|grass|wood]");
             ui.monospace("navigate_to(closest, energy|grass|wood|base)");
+            ui.monospace("if [not] carrying(kind) { ... } else { ... }");
+            ui.monospace("while [not] carrying(kind) { ... }");
+            ui.monospace("break | continue (inside a loop)");
             ui.label("'#' starts a comment.");
             ui.separator();
 
+            let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                let mut job = highlight_layout(text.as_str(), ui.style());
+                job.wrap.max_width = wrap_width;
+                ui.fonts_mut(|f| f.layout_job(job))
+            };
             ui.add(
                 egui::TextEdit::multiline(&mut editor.source)
                     .desired_rows(16)
                     .desired_width(f32::INFINITY)
-                    .font(egui::TextStyle::Monospace),
+                    .font(egui::TextStyle::Monospace)
+                    .layouter(&mut layouter),
             );
 
             if ui.button("Compile & Load").clicked() {
@@ -2647,6 +3073,520 @@ navigate_to(closest, base)
             err.contains("stone"),
             "error should mention the unknown token: {err}"
         );
+    }
+
+    // --- if/else branching --------------------------------------------------
+
+    #[test]
+    fn parse_program_compiles_bare_if_to_jump_ir() {
+        // `if cond { body }` becomes [JumpUnless(cond, past_body), <body>].
+        let actions = parse_program("if carrying(energy) {\ndrop\n}\n").unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Energy), 2),
+                Action::Drop,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_compiles_if_else_to_jump_ir() {
+        // `if cond { a } else { b }` becomes:
+        //   [JumpUnless(cond, else_start), <a>, Jump(end), <b>]
+        let actions = parse_program(
+            "if carrying(energy) {\ndrop\n} else {\npickup(energy)\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Energy), 3),
+                Action::Drop,
+                Action::Jump(4),
+                Action::Pickup(Some(ResourceKind::Energy)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_compiles_nested_if() {
+        // Two nested ifs both targeting the same end address.
+        let actions =
+            parse_program("if carrying(energy) {\nif carrying(grass) {\ndrop\n}\n}\n").unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Energy), 3),
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Grass), 3),
+                Action::Drop,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_rejects_unclosed_if_block() {
+        let err = parse_program("if carrying(energy) {\ndrop\n").unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("unclosed")
+                || err.to_ascii_lowercase().contains("unmatched"),
+            "error should mention the unclosed block: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_program_rejects_dangling_close_brace() {
+        let err = parse_program("drop\n}\n").unwrap_err();
+        assert!(
+            err.contains('}') || err.to_ascii_lowercase().contains("unmatched"),
+            "error should mention the stray brace: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_program_rejects_else_without_if() {
+        let err = parse_program("drop\n} else {\ndrop\n}\n").unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("else") || err.contains('}'),
+            "error should mention the unexpected else: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_program_rejects_unknown_condition() {
+        let err = parse_program("if at_base {\ndrop\n}\n").unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("condition") || err.contains("at_base"),
+            "error should mention the unknown condition: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_program_compiles_while_to_jump_ir() {
+        // `while cond { body }` becomes:
+        //   [JumpUnless(cond, end), <body>, Jump(loop_start)]
+        // where `end` lands past the back-jump.
+        let actions = parse_program("while carrying(energy) {\ndrop\n}\n").unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Energy), 3),
+                Action::Drop,
+                Action::Jump(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_compiles_while_not_to_jump_ir() {
+        // `while not cond { body }` exits when cond becomes TRUE — the same
+        // shape `until cond` used to compile to, but expressed via Python's
+        // `not` keyword instead of inventing our own loop verb.
+        let actions = parse_program("while not carrying(energy) {\npickup(energy)\n}\n").unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::JumpIf(Condition::Carrying(ResourceKind::Energy), 3),
+                Action::Pickup(Some(ResourceKind::Energy)),
+                Action::Jump(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_compiles_if_not_to_jump_ir() {
+        // `if not cond { body }` skips body when cond is TRUE — same logic
+        // as `while not`'s exit, but for one-shot branching.
+        let actions = parse_program("if not carrying(energy) {\ndrop\n}\n").unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::JumpIf(Condition::Carrying(ResourceKind::Energy), 2),
+                Action::Drop,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_rejects_until_keyword() {
+        let err = parse_program("until carrying(energy) {\ndrop\n}\n").unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("until")
+                || err.to_ascii_lowercase().contains("unknown"),
+            "until should no longer parse: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_program_compiles_break_to_jump_past_loop() {
+        // while cond { break }
+        // becomes:
+        //   [JumpUnless(cond, 3), Jump(3) <- break, Jump(0) <- back-edge]
+        // The break jumps past the back-edge (= loop exit).
+        let actions = parse_program("while carrying(energy) {\nbreak\n}\n").unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Energy), 3),
+                Action::Jump(3),
+                Action::Jump(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_compiles_continue_to_jump_to_loop_start() {
+        // while cond { continue }
+        // becomes:
+        //   [JumpUnless(cond, 3), Jump(0) <- continue, Jump(0) <- back-edge]
+        // continue jumps to the loop's top (where cond is re-evaluated).
+        let actions = parse_program("while carrying(energy) {\ncontinue\n}\n").unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Energy), 3),
+                Action::Jump(0),
+                Action::Jump(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_compiles_break_inside_nested_if_to_outer_loop_end() {
+        // while cond1 { if cond2 { break } }
+        // The break inside the `if` should still target the while's end,
+        // not just the if's end. Layout:
+        //   0: JumpUnless(energy, 4)   <- while top; exit at end of loop
+        //   1: JumpUnless(grass, 3)    <- if top; skip body lands at back-edge
+        //   2: Jump(4)                 <- break (targets while end)
+        //   3: Jump(0)                 <- back-edge to while top
+        //   4: <while end>
+        let actions = parse_program(
+            "while carrying(energy) {\nif carrying(grass) {\nbreak\n}\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            actions,
+            vec![
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Energy), 4),
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Grass), 3),
+                Action::Jump(4),
+                Action::Jump(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_program_rejects_break_outside_loop() {
+        let err = parse_program("break\n").unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("break"),
+            "error should mention break: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_program_rejects_continue_outside_loop() {
+        let err = parse_program("continue\n").unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("continue"),
+            "error should mention continue: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_program_rejects_break_inside_if_without_enclosing_loop() {
+        // if alone (no enclosing while) — break has nowhere to target.
+        let err = parse_program("if carrying(energy) {\nbreak\n}\n").unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("break"),
+            "error should mention break: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_program_rejects_unclosed_while() {
+        let err = parse_program("while carrying(energy) {\ndrop\n").unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("unclosed")
+                || err.to_ascii_lowercase().contains("while"),
+            "error should mention the unclosed loop: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_program_unclosed_if_reports_opening_line() {
+        let err = parse_program("drop\nif carrying(energy) {\ndrop\n").unwrap_err();
+        // The `if` is on line 2; the error should point at it, not the EOF.
+        assert!(
+            err.contains("line 2") || err.contains("2"),
+            "error should mention line 2: {err}"
+        );
+    }
+
+    // --- syntax highlight tokenizer (pure) ----------------------------------
+
+    #[test]
+    fn classify_identifier_recognizes_keywords() {
+        for kw in ["if", "else", "while", "break", "continue", "not"] {
+            assert_eq!(classify_identifier(kw), TokenKind::Keyword, "{kw}");
+        }
+    }
+
+    #[test]
+    fn classify_identifier_recognizes_verbs() {
+        for v in [
+            "pickup",
+            "grab",
+            "take",
+            "drop",
+            "deposit",
+            "deliver",
+            "wait",
+            "noop",
+            "navigate_to",
+            "goto",
+            "nav",
+        ] {
+            assert_eq!(classify_identifier(v), TokenKind::Verb, "{v}");
+        }
+    }
+
+    #[test]
+    fn classify_identifier_recognizes_arg_identifiers() {
+        for id in [
+            "energy", "grass", "wood", "base", "carrying", "closest", "n", "s", "e", "w", "north",
+            "south", "east", "west", "up", "down", "left", "right",
+        ] {
+            assert_eq!(classify_identifier(id), TokenKind::Identifier, "{id}");
+        }
+    }
+
+    #[test]
+    fn classify_identifier_is_case_insensitive() {
+        assert_eq!(classify_identifier("IF"), TokenKind::Keyword);
+        assert_eq!(classify_identifier("PickUp"), TokenKind::Verb);
+        assert_eq!(classify_identifier("Energy"), TokenKind::Identifier);
+    }
+
+    #[test]
+    fn classify_identifier_unknown_for_random_word() {
+        assert_eq!(classify_identifier("foo_bar"), TokenKind::Unknown);
+    }
+
+    #[test]
+    fn tokenize_classifies_a_full_if_line() {
+        let toks = tokenize("if carrying(energy) {");
+        let kinds: Vec<TokenKind> = toks.iter().map(|(_, k)| *k).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Keyword,    // if
+                TokenKind::Whitespace, // ' '
+                TokenKind::Identifier, // carrying
+                TokenKind::Punctuation,// (
+                TokenKind::Identifier, // energy
+                TokenKind::Punctuation,// )
+                TokenKind::Whitespace, // ' '
+                TokenKind::Punctuation,// {
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_treats_hash_to_eol_as_comment() {
+        let toks = tokenize("pickup(energy) # grab one\nnext");
+        // Find the comment token and verify its text.
+        let comment = toks.iter().find(|(_, k)| *k == TokenKind::Comment).unwrap();
+        assert_eq!(comment.0, "# grab one");
+        // The newline after the comment should be Whitespace, and `next`
+        // should be an identifier (unknown name in our DSL).
+        let post: Vec<_> = toks
+            .iter()
+            .skip_while(|(_, k)| *k != TokenKind::Comment)
+            .skip(1)
+            .collect();
+        assert!(post.first().is_some_and(|(_, k)| *k == TokenKind::Whitespace));
+    }
+
+    #[test]
+    fn tokenize_handles_navigate_to_underscore_as_one_token() {
+        let toks = tokenize("navigate_to(closest, base)");
+        assert_eq!(toks[0].0, "navigate_to");
+        assert_eq!(toks[0].1, TokenKind::Verb);
+    }
+
+    #[test]
+    fn tokenize_does_not_panic_on_non_ascii_input() {
+        // Multi-byte UTF-8 outside identifiers used to slice into the middle
+        // of a codepoint; this test pins the fix so a pasted emoji or accent
+        // in a comment doesn't crash the editor.
+        let toks = tokenize("# café 🎮\npickup");
+        // Just asserting we got a usable token list back is enough — the
+        // pre-fix panic happened during slicing.
+        assert!(toks.iter().any(|(_, k)| *k == TokenKind::Comment));
+        assert!(toks.iter().any(|(t, k)| *t == "pickup" && *k == TokenKind::Verb));
+    }
+
+    // --- evaluate_condition (pure) ------------------------------------------
+
+    #[test]
+    fn evaluate_carrying_true_when_kind_in_queue() {
+        let mut inv = Inventory::default();
+        inv.push(ResourceKind::Energy);
+        assert!(evaluate_condition(
+            Condition::Carrying(ResourceKind::Energy),
+            &inv,
+        ));
+    }
+
+    #[test]
+    fn evaluate_carrying_false_when_kind_absent() {
+        let mut inv = Inventory::default();
+        inv.push(ResourceKind::Grass);
+        assert!(!evaluate_condition(
+            Condition::Carrying(ResourceKind::Energy),
+            &inv,
+        ));
+    }
+
+    // --- step_workers jump execution ----------------------------------------
+
+    fn spawn_jump_test_worker(
+        world: &mut bevy::ecs::world::World,
+        inv: Inventory,
+        instructions: Vec<Action>,
+    ) -> Entity {
+        world
+            .spawn((
+                Worker,
+                GridPos { x: 5, y: 5 },
+                inv,
+                NavState::default(),
+                Facing {
+                    prev_yaw: 0.0,
+                    current_yaw: 0.0,
+                },
+                Program {
+                    instructions,
+                    pc: 0,
+                },
+            ))
+            .id()
+    }
+
+    fn jump_test_world() -> bevy::ecs::world::World {
+        let mut world = bevy::ecs::world::World::new();
+        world.insert_resource(World {
+            tiles: vec![Terrain::Grass; (GRID_W * GRID_H) as usize],
+        });
+        world.insert_resource(dummy_resource_assets());
+        world
+    }
+
+    #[test]
+    fn jump_unless_redirects_pc_when_condition_false() {
+        // Empty inventory → carrying(energy) is false → JumpUnless takes the
+        // jump to pc=2, skipping the Wait at pc=1.
+        let mut world = jump_test_world();
+        let w = spawn_jump_test_worker(
+            &mut world,
+            Inventory::default(),
+            vec![
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Energy), 2),
+                Action::Wait,
+                Action::Drop,
+            ],
+        );
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert_eq!(world.get::<Program>(w).unwrap().pc, 2);
+    }
+
+    #[test]
+    fn jump_unless_falls_through_when_condition_true() {
+        // Inventory carries energy → JumpUnless does NOT jump → pc advances
+        // by 1 to the Wait.
+        let mut world = jump_test_world();
+        let mut inv = Inventory::default();
+        inv.push(ResourceKind::Energy);
+        let w = spawn_jump_test_worker(
+            &mut world,
+            inv,
+            vec![
+                Action::JumpUnless(Condition::Carrying(ResourceKind::Energy), 2),
+                Action::Wait,
+                Action::Drop,
+            ],
+        );
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert_eq!(world.get::<Program>(w).unwrap().pc, 1);
+    }
+
+    #[test]
+    fn jump_sets_pc_unconditionally() {
+        let mut world = jump_test_world();
+        let w = spawn_jump_test_worker(
+            &mut world,
+            Inventory::default(),
+            vec![Action::Jump(2), Action::Wait, Action::Drop],
+        );
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert_eq!(world.get::<Program>(w).unwrap().pc, 2);
+    }
+
+    #[test]
+    fn jump_if_redirects_pc_when_condition_true() {
+        // Inverse of jump_unless: JumpIf takes the jump when cond is TRUE.
+        let mut world = jump_test_world();
+        let mut inv = Inventory::default();
+        inv.push(ResourceKind::Energy);
+        let w = spawn_jump_test_worker(
+            &mut world,
+            inv,
+            vec![
+                Action::JumpIf(Condition::Carrying(ResourceKind::Energy), 2),
+                Action::Wait,
+                Action::Drop,
+            ],
+        );
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert_eq!(world.get::<Program>(w).unwrap().pc, 2);
+    }
+
+    #[test]
+    fn jump_if_falls_through_when_condition_false() {
+        let mut world = jump_test_world();
+        let w = spawn_jump_test_worker(
+            &mut world,
+            Inventory::default(),
+            vec![
+                Action::JumpIf(Condition::Carrying(ResourceKind::Energy), 2),
+                Action::Wait,
+                Action::Drop,
+            ],
+        );
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(step_workers);
+        schedule.run(&mut world);
+
+        assert_eq!(world.get::<Program>(w).unwrap().pc, 1);
     }
 
     // --- inventory queue ----------------------------------------------------
