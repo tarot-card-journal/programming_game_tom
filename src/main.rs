@@ -74,9 +74,9 @@ enum Action {
     Drop,
     NavigateTo(NavQualifier, Target),
     // Branching IR — emitted by the parser when compiling if/else and
-    // while/until blocks. Users don't write these directly; they're flat-IR
-    // equivalents of the block syntax. The usize is an instruction index
-    // into the same Program.
+    // while blocks (with optional `not` selecting JumpIf vs JumpUnless).
+    // Users don't write these directly; they're flat-IR equivalents of the
+    // block syntax. The usize is an instruction index into the same Program.
     Jump(usize),
     JumpIf(Condition, usize),
     JumpUnless(Condition, usize),
@@ -1113,9 +1113,9 @@ fn parse_program(src: &str) -> Result<Vec<Action>, String> {
             .to_ascii_lowercase();
         let words: Vec<&str> = normalized.split_whitespace().collect();
 
-        // Block control: `if cond {`, `} else {`, `while cond {`, `until cond {`,
-        // `}`. These don't push an action of their own; they push/pop frames
-        // and emit synthetic jumps.
+        // Block control: `if cond {`, `} else {`, `while cond {`, `}`. These
+        // don't push an action of their own; they push/pop frames and emit
+        // synthetic jumps.
         match words.as_slice() {
             ["if", cond_tokens @ .., "{"] => {
                 let expr = parse_cond_expr(cond_tokens).map_err(|e| {
@@ -1271,7 +1271,10 @@ fn parse_program(src: &str) -> Result<Vec<Action>, String> {
         out.push(action);
     }
 
-    if let Some(frame) = frames.first() {
+    // Report the innermost open frame, not the outermost — that's where the
+    // missing `}` most likely belongs (deepest indent level, closest to the
+    // user's cursor while writing).
+    if let Some(frame) = frames.last() {
         return Err(format!(
             "unclosed `{}` block opened on line {}",
             frame.kind(),
@@ -1284,9 +1287,9 @@ fn parse_program(src: &str) -> Result<Vec<Action>, String> {
     Ok(out)
 }
 
-// Set the target of a Jump or JumpUnless that was pushed with a placeholder.
-// Callers guarantee `action` is one of those two variants — anything else is
-// a parser bug, not a user error.
+// Set the target of a Jump, JumpIf, or JumpUnless that was pushed with a
+// placeholder. Callers guarantee `action` is one of those three variants —
+// anything else is a parser bug, not a user error.
 fn patch_jump_target(action: &mut Action, target: usize) {
     match action {
         Action::Jump(t) | Action::JumpIf(_, t) | Action::JumpUnless(_, t) => *t = target,
@@ -3321,6 +3324,21 @@ navigate_to(closest, base)
         assert!(
             err.contains("line 2") || err.contains("2"),
             "error should mention line 2: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_program_unclosed_nested_reports_innermost() {
+        // Outer `while` on line 1, inner `if` on line 2, both unclosed.
+        // The reported line should be the innermost (line 2) since that's
+        // where the user most likely needs to add a `}`.
+        let err = parse_program(
+            "while carrying(energy) {\nif carrying(grass) {\ndrop\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("line 2"),
+            "error should point at innermost open block (line 2): {err}"
         );
     }
 
